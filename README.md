@@ -19,21 +19,20 @@ There is also a menu bar app with the same controls and the settings:
 
     ┌──────────────────────────────────────────┐
     │ Stay Awake                  [ ON  ●───]  │
+    │  ( Now )  Settings   Schedule            │
     │                                          │
     │ Staying awake                            │
-    │ 2 things working (claude, claude)        │
-    │ Awake 14m so far, no time limit          │
+    │ 2 things working now (claude, claude)    │
+    │ Awake 14m. Nothing will interrupt it.    │
     │ Battery 76%, on power                    │
     │                                          │
-    │ [ Keep awake ▾ ] [ Let it sleep ]        │
-    │ or until [ 08:00 ] [ Hold ]              │
-    │                                          │
-    │ Sleep when quiet for  ──●─────  1h       │
-    │ Remind me every       ────●───  6h       │
-    │ Battery limit         ─●──────  15%      │
-    │ [✓] Wake the Mac daily at [ 07:30 ]      │
-    │ [✓] Tell me when it changes              │
+    │ [ Automatic | Keep awake | Let it sleep ]│
+    │ Keep awake until [ 08:00 ]  [ Set ]      │
     └──────────────────────────────────────────┘
+
+    Settings holds three sliders: how long nothing may happen before the Mac
+    sleeps, how often to remind you it is awake, and the battery level that
+    ends a hold. Schedule holds the wake times.
 
 ## How it decides
 
@@ -78,7 +77,6 @@ looked continuous from the outside. With a short window, that Mac would have sle
 | `IDLE_WINDOW` | 1h | everything must be quiet this long before sleep is allowed |
 | `REMIND_EVERY` | 6h | reminds you the Mac is still being kept awake. `0` disables it |
 | `BATTERY_FLOOR` | 15% | stops keeping awake when discharging at or below this |
-| `WAKE_DAILY` | off | `HH:MM` to wake this Mac every day |
 | `NOTIFY` | all | `all`, `forced` (limits only), or `none` |
 | `MATCH` | caffeinate | process name that counts as work in progress |
 
@@ -112,9 +110,21 @@ fire while a Mac is asleep, so an orchestration that expects to resume at 04:00 
 stops. If that matters, set a daily wake (`WAKE_DAILY`, or the checkbox in the app) so the machine
 comes back by itself and work can continue.
 
-`WAKE_DAILY` uses `pmset repeat`, which holds a single repeating schedule for the whole machine.
-Setting it here replaces any repeating power schedule you set up yourself, and turning it off
-cancels that schedule rather than restoring what was there before.
+## Waking the Mac again
+
+Wake times live in `~/.stayawake/schedule`, one per line, and the Schedule tab edits them:
+
+    08:00 MTWRF      weekday mornings
+    21:30 SU         weekend evenings
+    14:00 MTWRFSU    every day
+
+Days are `M T W R F S U`, where `R` is Thursday and `U` is Sunday, matching what `pmset` uses.
+
+macOS allows only **one** repeating power schedule per machine (`pmset repeat`), which could not
+express several wakes a day, and taking it would overwrite whatever you had set there yourself. So
+this instead lays down individual one-off events tagged with its own owner name, a week ahead, and
+tops them up as they are used. It cancels only events carrying that tag, so power schedules created
+by anything else on the Mac are never touched.
 
 ## Install
 

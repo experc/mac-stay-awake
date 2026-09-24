@@ -13,6 +13,7 @@ enum Paths {
     static let veto = dir.appendingPathComponent("veto")
     static let disabled = dir.appendingPathComponent("disabled")
     static let heartbeat = dir.appendingPathComponent("app-alive")
+    static let schedule = dir.appendingPathComponent("schedule")
 }
 
 struct Status {
@@ -30,11 +31,50 @@ struct Status {
     var idleWindow = 3600
     var remindEvery = 21600
     var batteryFloor = 15
-    var wakeDaily = ""
+    var nextWake = ""
     var off = false
 
     var daemonAlive: Bool { updated > 0 && Date().timeIntervalSince1970 - updated < 30 }
     var onBattery: Bool { batteryState == "discharging" }
+}
+
+enum Mode: String, CaseIterable {
+    case automatic = "Automatic"
+    case keepAwake = "Keep awake"
+    case letSleep = "Let it sleep"
+}
+
+/// One line of the schedule file: a time, and the days it applies to.
+struct WakeEntry: Identifiable, Equatable {
+    let id = UUID()
+    var hour: Int
+    var minute: Int
+    var days: Set<Int>          // 1 = Monday ... 7 = Sunday
+
+    static let letters = ["M", "T", "W", "R", "F", "S", "U"]
+    static let labels = ["M", "T", "W", "T", "F", "S", "S"]
+
+    var fileLine: String {
+        let d = (1...7).filter { days.contains($0) }.map { WakeEntry.letters[$0 - 1] }.joined()
+        return String(format: "%02d:%02d %@", hour, minute, d)
+    }
+
+    var date: Date {
+        Calendar.current.date(from: DateComponents(hour: hour, minute: minute)) ?? Date()
+    }
+
+    static func parse(_ line: String) -> WakeEntry? {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count == 2 else { return nil }
+        let hm = parts[0].split(separator: ":")
+        guard hm.count == 2, let h = Int(hm[0]), let m = Int(hm[1]) else { return nil }
+        var days = Set<Int>()
+        for ch in parts[1] {
+            if let i = letters.firstIndex(of: String(ch)) { days.insert(i + 1) }
+        }
+        guard !days.isEmpty else { return nil }
+        return WakeEntry(hour: h, minute: m, days: days)
+    }
 }
 
 func readKeyValues(_ url: URL) -> [String: String] {
@@ -58,6 +98,12 @@ func shortDuration(_ seconds: Int) -> String {
     return "\(seconds / 60)m"
 }
 
+func clockString(_ epoch: Double) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm"
+    return f.string(from: Date(timeIntervalSince1970: epoch))
+}
+
 @MainActor
 final class Model: ObservableObject {
     @Published var s = Status()
@@ -66,9 +112,9 @@ final class Model: ObservableObject {
     @Published var batteryFloor: Double = 15
     @Published var notifyOn = true
     @Published var enabled = true
-    @Published var wakeEnabled = false
-    @Published var wakeTime = Calendar.current.date(from: DateComponents(hour: 8, minute: 0)) ?? Date()
     @Published var holdUntil = Calendar.current.date(from: DateComponents(hour: 8, minute: 0)) ?? Date()
+    @Published var entries: [WakeEntry] = []
+    @Published var leaseExpiry: Double = 0
 
     private var timer: Timer?
     private var lastDisabled: Bool?
@@ -76,6 +122,7 @@ final class Model: ObservableObject {
 
     init() {
         loadConfig()
+        loadSchedule()
         enabled = !FileManager.default.fileExists(atPath: Paths.disabled.path)
         tick()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -105,9 +152,12 @@ final class Model: ObservableObject {
         new.idleWindow = Int(kv["idle_window"] ?? "") ?? 3600
         new.remindEvery = Int(kv["remind_every"] ?? "") ?? 0
         new.batteryFloor = Int(kv["battery_floor"] ?? "") ?? 15
-        new.wakeDaily = kv["wake_daily"] ?? ""
+        new.nextWake = kv["next_wake"] ?? ""
         new.off = kv["off"] == "1"
         s = new
+
+        leaseExpiry = Double((try? String(contentsOf: Paths.lease, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
 
         // Tells the helper an app is running, so it does not also post its own
         // notifications from osascript.
@@ -125,13 +175,13 @@ final class Model: ObservableObject {
         if nowHolding {
             content.title = "Staying awake"
             content.body = s.holders > 0
-                ? "\(s.holders) thing\(s.holders == 1 ? "" : "s") working. The lid can stay closed."
-                : "You asked to keep the Mac awake."
+                ? "\(s.holders) thing\(s.holders == 1 ? "" : "s") working. You can close the lid."
+                : "You set the Mac to stay awake."
         } else {
-            content.title = "Back to normal sleep"
+            content.title = "Sleeping normally again"
             switch s.latched {
-            case "battery": content.body = "Battery got low, so the Mac can sleep again."
-            default: content.body = s.off ? "Stay Awake is turned off." : "Everything has been quiet, so the Mac can sleep again."
+            case "battery": content.body = "The battery got low, so the Mac can sleep."
+            default: content.body = s.off ? "Stay Awake is switched off." : "Nothing has happened for a while, so the Mac can sleep."
             }
         }
         UNUserNotificationCenter.current().add(
@@ -140,26 +190,12 @@ final class Model: ObservableObject {
 
     // MARK: settings
 
-    private func hhmm(_ date: Date) -> String {
-        let c = Calendar.current.dateComponents([.hour, .minute], from: date)
-        return String(format: "%02d:%02d", c.hour ?? 0, c.minute ?? 0)
-    }
-
-    private func date(fromHHMM s: String) -> Date? {
-        let parts = s.split(separator: ":")
-        guard parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]) else { return nil }
-        return Calendar.current.date(from: DateComponents(hour: h, minute: m))
-    }
-
     func loadConfig() {
         let kv = readKeyValues(Paths.config)
         if let v = Int(kv["IDLE_WINDOW"] ?? kv["GRACE"] ?? "") { idleWindowMinutes = max(15, Double(v) / 60) }
         if let v = Int(kv["REMIND_EVERY"] ?? "") { remindEveryHours = Double(v) / 3600 }
         if let v = Int(kv["BATTERY_FLOOR"] ?? "") { batteryFloor = Double(v) }
         notifyOn = (kv["NOTIFY"] ?? "all") != "none"
-        let wake = kv["WAKE_DAILY"] ?? ""
-        wakeEnabled = !wake.isEmpty
-        if let d = date(fromHHMM: wake) { wakeTime = d }
     }
 
     func saveConfig() {
@@ -167,6 +203,7 @@ final class Model: ObservableObject {
         let text = """
         # Settings for stayawake. The app writes this file; the helper re-reads it
         # every few seconds, so changes take effect without a restart.
+        # Wake times live in the `schedule` file next to this one.
 
         POLL=\(kv["POLL"] ?? "5")
         IDLE_WINDOW=\(Int(idleWindowMinutes * 60))
@@ -174,13 +211,57 @@ final class Model: ObservableObject {
         BATTERY_FLOOR=\(Int(batteryFloor))
         NOTIFY=\(notifyOn ? "all" : "none")
         MATCH=\(kv["MATCH"] ?? "caffeinate")
-        WAKE_DAILY=\(wakeEnabled ? hhmm(wakeTime) : "")
 
         """
         try? text.write(to: Paths.config, atomically: true, encoding: .utf8)
     }
 
-    // MARK: actions
+    // MARK: schedule
+
+    func loadSchedule() {
+        let text = (try? String(contentsOf: Paths.schedule, encoding: .utf8)) ?? ""
+        entries = text.split(separator: "\n").compactMap {
+            let line = $0.prefix(while: { $0 != "#" }).trimmingCharacters(in: .whitespaces)
+            return line.isEmpty ? nil : WakeEntry.parse(line)
+        }
+    }
+
+    func saveSchedule() {
+        let body = entries.filter { !$0.days.isEmpty }.map(\.fileLine).joined(separator: "\n")
+        let text = """
+        # Times to wake this Mac, one per line: a time and the days it applies to.
+        # Days are M T W R F S U, where R is Thursday and U is Sunday.
+        \(body)
+
+        """
+        try? text.write(to: Paths.schedule, atomically: true, encoding: .utf8)
+    }
+
+    func addEntry() {
+        entries.append(WakeEntry(hour: 8, minute: 0, days: [1, 2, 3, 4, 5]))
+        saveSchedule()
+    }
+
+    func removeEntry(_ entry: WakeEntry) {
+        entries.removeAll { $0.id == entry.id }
+        saveSchedule()
+    }
+
+    // MARK: mode
+
+    var mode: Mode {
+        if s.veto { return .letSleep }
+        if s.manual { return .keepAwake }
+        return .automatic
+    }
+
+    func setMode(_ m: Mode) {
+        switch m {
+        case .automatic: backToAutomatic()
+        case .keepAwake: keepAwake(hours: nil)
+        case .letSleep: letSleep(hours: 1)
+        }
+    }
 
     private func write(_ url: URL, expiry: Double) {
         try? String(Int(expiry)).write(to: url, atomically: true, encoding: .utf8)
@@ -223,33 +304,35 @@ final class Model: ObservableObject {
     // MARK: wording
 
     var headline: String {
-        if !s.daemonAlive { return "Helper not running" }
-        if s.off { return "Turned off" }
+        if !s.daemonAlive { return "Not working" }
+        if s.off { return "Switched off" }
         return s.sleepDisabled ? "Staying awake" : "Sleeping normally"
     }
 
     var detail: String {
-        if !s.daemonAlive { return "Nothing is managing sleep right now." }
-        if s.off { return "The Mac sleeps as it normally would, lid close included." }
+        if !s.daemonAlive { return "The background service is not running, so nothing is being kept awake." }
+        if s.off { return "The Mac sleeps as it normally would, including when you close the lid." }
         var lines: [String] = []
         if s.holders > 0 {
             let names = s.holderNames.isEmpty ? "" : " (\(s.holderNames.split(separator: " ").joined(separator: ", ")))"
-            lines.append("\(s.holders) thing\(s.holders == 1 ? "" : "s") working\(names)")
+            lines.append("\(s.holders) thing\(s.holders == 1 ? "" : "s") working now\(names)")
         } else if s.manual {
-            lines.append("You asked to keep it awake")
+            lines.append(leaseExpiry > 0
+                ? "You set it to stay awake until \(clockString(leaseExpiry))"
+                : "You set it to stay awake until you switch it back")
         } else {
-            lines.append("Nothing is working")
+            lines.append("Nothing is working right now")
         }
         if s.sleepDisabled && s.holdSince > 0 {
             let mins = Int((Date().timeIntervalSince1970 - s.holdSince) / 60)
-            lines.append("Awake \(mins < 60 ? "\(mins)m" : "\(mins / 60)h \(mins % 60)m") so far, no time limit")
+            lines.append("Awake \(mins < 60 ? "\(mins)m" : "\(mins / 60)h \(mins % 60)m"). Nothing will interrupt it.")
         }
         if s.idleSince > 0 {
             let left = Int((Double(s.idleWindow) - (Date().timeIntervalSince1970 - s.idleSince)) / 60)
-            lines.append("Quiet: sleeping in about \(max(0, left))m unless work resumes")
+            lines.append("Quiet so far. It sleeps in about \(max(0, left))m unless something starts.")
         }
-        if s.veto { lines.append("You asked to let it sleep") }
-        if s.latched == "battery" { lines.append("Stopped: battery below \(s.batteryFloor)%") }
+        if s.veto { lines.append("You allowed it to sleep, even while work is running") }
+        if s.latched == "battery" { lines.append("Stopped: the battery is below \(s.batteryFloor)%") }
         lines.append("Battery \(s.batteryPct)%, \(s.onBattery ? "on battery" : "on power")")
         return lines.joined(separator: "\n")
     }
@@ -262,17 +345,180 @@ final class Model: ObservableObject {
 
 struct Caption: View {
     let text: String
+    init(_ text: String) { self.text = text }
     var body: some View {
         Text(text).font(.caption2).foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
     }
 }
 
-struct PanelView: View {
+struct NowTab: View {
     @ObservedObject var model: Model
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(model.headline).font(.title3).fontWeight(.semibold)
+                Text(model.detail).font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if model.enabled {
+                Picker("", selection: Binding(
+                    get: { model.mode },
+                    set: { model.setMode($0) }
+                )) {
+                    ForEach(Mode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                Caption("Automatic stays awake while something is working. The other two are yours to set and stay until you change them back.")
+
+                HStack(spacing: 6) {
+                    Text("Keep awake until").font(.callout)
+                    DatePicker("", selection: $model.holdUntil, displayedComponents: .hourAndMinute)
+                        .labelsHidden().frame(width: 76)
+                    Button("Set") { model.keepAwakeUntil(model.holdUntil) }
+                }
+                Caption("Best for work you start deliberately, such as something left running overnight.")
+            }
+            Spacer()
+        }
+    }
+}
+
+struct SettingsTab: View {
+    @ObservedObject var model: Model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text("Sleep after nothing happens for").font(.callout)
+                    Spacer()
+                    Text(shortDuration(Int(model.idleWindowMinutes) * 60)).monospacedDigit()
+                }
+                Slider(value: $model.idleWindowMinutes, in: 15...240, step: 15) { editing in
+                    if !editing { model.saveConfig() }
+                }
+                Caption("Short pauses are normal while work is running, so the Mac waits this long before sleeping.")
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text("Remind me every").font(.callout)
+                    Spacer()
+                    Text(model.remindEveryHours == 0 ? "never" : "\(Int(model.remindEveryHours))h").monospacedDigit()
+                }
+                Slider(value: $model.remindEveryHours, in: 0...24, step: 1) { editing in
+                    if !editing { model.saveConfig() }
+                }
+                Caption("A reminder that the Mac is still awake. It never stops anything.")
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text("Let it sleep if the battery falls below").font(.callout)
+                    Spacer()
+                    Text("\(Int(model.batteryFloor))%").monospacedDigit()
+                }
+                Slider(value: $model.batteryFloor, in: 5...80, step: 5) { editing in
+                    if !editing { model.saveConfig() }
+                }
+                Caption("If the battery drops this low, the Mac may sleep even if work is running.")
+            }
+
+            Toggle("Notify me when this changes", isOn: Binding(
+                get: { model.notifyOn },
+                set: { model.notifyOn = $0; model.saveConfig() }
+            ))
+            .font(.callout)
+            Spacer()
+        }
+    }
+}
+
+struct DayPicker: View {
+    @Binding var days: Set<Int>
+    var onChange: () -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(1...7, id: \.self) { d in
+                let on = days.contains(d)
+                Button(WakeEntry.labels[d - 1]) {
+                    if on { days.remove(d) } else { days.insert(d) }
+                    onChange()
+                }
+                .buttonStyle(.plain)
+                .frame(width: 20, height: 20)
+                .background(on ? Color.accentColor : Color.secondary.opacity(0.15))
+                .foregroundStyle(on ? Color.white : Color.primary)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .font(.caption)
+            }
+        }
+    }
+}
+
+struct ScheduleTab: View {
+    @ObservedObject var model: Model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Caption("While the Mac sleeps, nothing scheduled runs. Waking it lets work carry on by itself.")
+
+            if model.entries.isEmpty {
+                Text("No wake times set.").font(.callout).foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(spacing: 8) {
+                        ForEach($model.entries) { $entry in
+                            HStack(spacing: 8) {
+                                DatePicker("", selection: Binding(
+                                    get: { entry.date },
+                                    set: { newDate in
+                                        let c = Calendar.current.dateComponents([.hour, .minute], from: newDate)
+                                        entry.hour = c.hour ?? 8
+                                        entry.minute = c.minute ?? 0
+                                        model.saveSchedule()
+                                    }
+                                ), displayedComponents: .hourAndMinute)
+                                .labelsHidden().frame(width: 76)
+
+                                DayPicker(days: $entry.days) { model.saveSchedule() }
+
+                                Button {
+                                    model.removeEntry(entry)
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 150)
+            }
+
+            Button("Add a wake time") { model.addEntry() }
+
+            if !model.s.nextWake.isEmpty {
+                Text("Next wake: \(model.s.nextWake)").font(.callout).foregroundStyle(.secondary)
+            }
+            Caption("Only wake times added here are touched. Anything else that schedules power events on this Mac is left alone.")
+            Spacer()
+        }
+    }
+}
+
+struct PanelView: View {
+    @ObservedObject var model: Model
+    @State private var tab = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("Stay Awake").font(.headline)
                 Spacer()
@@ -284,107 +530,23 @@ struct PanelView: View {
                 .toggleStyle(.switch)
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(model.headline).font(.title3).fontWeight(.semibold)
-                Text(model.detail).font(.callout).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            TabView(selection: $tab) {
+                NowTab(model: model).padding(.top, 8).tabItem { Text("Now") }.tag(0)
+                SettingsTab(model: model).padding(.top, 8).tabItem { Text("Settings") }.tag(1)
+                ScheduleTab(model: model).padding(.top, 8).tabItem { Text("Schedule") }.tag(2)
             }
-
-            if model.enabled {
-                HStack(spacing: 8) {
-                    Menu("Keep awake") {
-                        Button("for 1 hour") { model.keepAwake(hours: 1) }
-                        Button("for 2 hours") { model.keepAwake(hours: 2) }
-                        Button("for 4 hours") { model.keepAwake(hours: 4) }
-                        Button("until I turn it off") { model.keepAwake(hours: nil) }
-                    }
-                    .frame(width: 118)
-                    Button("Let it sleep") { model.letSleep(hours: 1) }
-                    if model.s.manual || model.s.veto {
-                        Button("Automatic") { model.backToAutomatic() }
-                    }
-                }
-                HStack(spacing: 6) {
-                    Text("or until").font(.callout)
-                    DatePicker("", selection: $model.holdUntil, displayedComponents: .hourAndMinute)
-                        .labelsHidden().frame(width: 76)
-                    Button("Hold") { model.keepAwakeUntil(model.holdUntil) }
-                }
-                Caption(text: "For a run you start deliberately, holding until a set time is surer than relying on detection.")
-            }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 10) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack {
-                        Text("Sleep when quiet for").frame(width: 130, alignment: .leading)
-                        Slider(value: $model.idleWindowMinutes, in: 15...240, step: 15) { editing in
-                            if !editing { model.saveConfig() }
-                        }
-                        Text(shortDuration(Int(model.idleWindowMinutes) * 60))
-                            .frame(width: 42, alignment: .trailing).monospacedDigit()
-                    }
-                    Caption(text: "Work stops and restarts constantly, so only this much continuous quiet counts as finished.")
-                }
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack {
-                        Text("Remind me every").frame(width: 130, alignment: .leading)
-                        Slider(value: $model.remindEveryHours, in: 0...24, step: 1) { editing in
-                            if !editing { model.saveConfig() }
-                        }
-                        Text(model.remindEveryHours == 0 ? "never" : "\(Int(model.remindEveryHours))h")
-                            .frame(width: 42, alignment: .trailing).monospacedDigit()
-                    }
-                    Caption(text: "Nothing is ever cut off. This just tells you the Mac is still being kept awake.")
-                }
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack {
-                        Text("Battery limit").frame(width: 130, alignment: .leading)
-                        Slider(value: $model.batteryFloor, in: 5...80, step: 5) { editing in
-                            if !editing { model.saveConfig() }
-                        }
-                        Text("\(Int(model.batteryFloor))%")
-                            .frame(width: 42, alignment: .trailing).monospacedDigit()
-                    }
-                    Caption(text: "The one limit that does end a hold, so an unplugged Mac cannot run itself flat.")
-                }
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack {
-                        Toggle("Wake the Mac daily at", isOn: Binding(
-                            get: { model.wakeEnabled },
-                            set: { model.wakeEnabled = $0; model.saveConfig() }
-                        ))
-                        DatePicker("", selection: $model.wakeTime, displayedComponents: .hourAndMinute)
-                            .labelsHidden().frame(width: 76)
-                            .disabled(!model.wakeEnabled)
-                            .onChange(of: model.wakeTime) { model.saveConfig() }
-                    }
-                    Caption(text: "Sleep ends a run rather than pausing it. A daily wake gives overnight work a chance to resume.")
-                }
-
-                Toggle("Tell me when it changes", isOn: Binding(
-                    get: { model.notifyOn },
-                    set: { model.notifyOn = $0; model.saveConfig() }
-                ))
-                .font(.callout)
-            }
-
-            Divider()
+            .frame(height: 300)
 
             HStack {
-                Text(model.s.daemonAlive ? "Helper running" : "Helper not running")
+                Text(model.s.daemonAlive ? "Background service running" : "Background service not running")
                     .font(.caption).foregroundStyle(model.s.daemonAlive ? Color.secondary : Color.red)
                 Spacer()
-                Text("Quit closes this window only").font(.caption2).foregroundStyle(.secondary)
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.link).font(.caption)
             }
+            Caption("Quit hides the icon. The Mac keeps whatever is set here.")
         }
         .padding(14)
-        .frame(width: 380)
+        .frame(width: 400)
     }
 }
 

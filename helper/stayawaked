@@ -37,6 +37,7 @@ CONFIG=
 STATE=
 LEASE=
 VETO=
+SCHEDULE=
 
 # Defaults. Anything here can be overridden per machine in the config file.
 POLL=5
@@ -45,7 +46,13 @@ REMIND_EVERY=21600
 BATTERY_FLOOR=15
 NOTIFY=all
 MATCH=caffeinate
-WAKE_DAILY=
+
+# Wake events this tool creates are tagged with this owner, so they can be
+# cancelled precisely and power schedules set up by anything else are never
+# touched. `pmset repeat` is deliberately not used: the machine has only one
+# repeating schedule and it may not be ours to take.
+SCHED_OWNER=com.macstayawake
+DOW_LETTERS=(M T W R F S U)
 
 log() {
   print -r -- "$(strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS) $*" >> $LOG
@@ -74,9 +81,10 @@ BATTERY_FLOOR=15    # %: stop keeping awake when discharging at or below this
 NOTIFY=all          # all | forced | none
 MATCH=caffeinate    # process name that counts as work in progress
 
-WAKE_DAILY=         # HH:MM to wake this Mac every day, or empty for never.
-                    # Sleep ENDS a run rather than pausing it, so a scheduled
-                    # wake is how an overnight scenario gets a chance to resume.
+# Wake times live in the `schedule` file next to this one, one per line, as a
+# time and the days it applies to:  08:00 MTWRF
+# While the Mac sleeps nothing scheduled runs, so a wake is how overnight work
+# gets a chance to carry on.
 CONF
   chown $USER_NAME $CONFIG 2>/dev/null
   chmod 644 $CONFIG 2>/dev/null
@@ -102,6 +110,7 @@ resolve_user() {
     STATE=$STATE_DIR/state
     LEASE=$STATE_DIR/lease
     VETO=$STATE_DIR/veto
+    SCHEDULE=$STATE_DIR/schedule
     if [[ ! -d $STATE_DIR ]]; then
       mkdir -p $STATE_DIR
       chown $USER_NAME $STATE_DIR 2>/dev/null
@@ -131,9 +140,6 @@ load_config() {
       (BATTERY_FLOOR) [[ $val == <-> ]] && (( val >= 0 && val <= 95 ))      && BATTERY_FLOOR=$val ;;
       (NOTIFY)        [[ $val == (all|forced|none) ]]                       && NOTIFY=$val ;;
       (MATCH)         [[ $val =~ '^[A-Za-z0-9_.-]+$' ]]                     && MATCH=$val ;;
-      (WAKE_DAILY)    if [[ -z $val ]]; then WAKE_DAILY=
-                      elif [[ $val =~ '^([01][0-9]|2[0-3]):[0-5][0-9]$' ]]; then WAKE_DAILY=$val
-                      fi ;;
     esac
   done < $CONFIG
 }
@@ -180,24 +186,66 @@ apply() {
   fi
 }
 
-# A daily wake, so an overnight run has a chance to resume after the Mac has
-# been allowed to sleep. `pmset repeat` owns ONE repeating schedule for the
-# whole machine, so this is only touched when the setting actually changes.
-#
-# It starts empty rather than "unknown" on purpose: with no daily wake
-# configured there is nothing to do, and cancelling anyway would wipe a
-# repeating schedule the user set up themselves, at every boot.
-wake_applied=
-apply_wake_schedule() {
-  [[ $WAKE_DAILY == $wake_applied ]] && return
-  if [[ -z $WAKE_DAILY ]]; then
-    pmset repeat cancel 2>/dev/null
-    log "daily wake cancelled"
-  else
-    pmset repeat wakeorpoweron MTWRFSU ${WAKE_DAILY}:00 2>/dev/null
-    log "daily wake set for $WAKE_DAILY"
+# Wake schedule. The machine's single repeating schedule (`pmset repeat`) cannot
+# express several times a day, so each wanted wake is laid down as its own
+# one-off event, tagged with our owner, and topped up as events are consumed.
+sched_mtime=0
+sched_next_check=0
+next_wake=
+reconcile_schedule() {
+  local now=$1 mtime=0 line time days d stamp dow letter out soonest=0
+  [[ -n $STATE_DIR ]] || return
+  [[ -f $SCHEDULE ]] && mtime=$(stat -f %m $SCHEDULE 2>/dev/null)
+  (( mtime == sched_mtime && now < sched_next_check )) && return
+  sched_mtime=$mtime
+  sched_next_check=$(( now + 600 ))
+
+  local -a wanted have
+  wanted=()
+  if [[ -f $SCHEDULE ]]; then
+    while IFS= read -r line; do
+      line=${line%%\#*}
+      [[ -z ${line//[[:space:]]/} ]] && continue
+      time=${${(z)line}[1]}
+      days=${${(z)line}[2]}
+      [[ $time =~ '^([01][0-9]|2[0-3]):[0-5][0-9]$' ]] || continue
+      [[ $days =~ '^[MTWRFSU]+$' ]] || continue
+      # Lay down the coming week, so a helper that is off for a day or two
+      # still leaves valid events behind.
+      for d in {0..7}; do
+        stamp=$(strftime -r '%Y-%m-%d %H:%M' "$(strftime '%Y-%m-%d' $(( now + d * 86400 ))) $time" 2>/dev/null) || continue
+        (( stamp <= now + 60 )) && continue
+        dow=$(strftime '%u' $stamp)
+        letter=$DOW_LETTERS[$dow]
+        [[ $days == *$letter* ]] || continue
+        wanted+=("$(strftime '%m/%d/%Y %H:%M:%S' $stamp)")
+        (( soonest == 0 || stamp < soonest )) && soonest=$stamp
+      done
+    done < $SCHEDULE
   fi
-  wake_applied=$WAKE_DAILY
+
+  have=(${(f)"$(pmset -g sched 2>/dev/null | grep -F "by '$SCHED_OWNER'" | sed -E 's/.*at ([0-9\/]+ [0-9:]+).*/\1/')"})
+  next_wake=${have[1]:-}
+
+  local w h found
+  for h in $have; do
+    [[ -z $h ]] && continue
+    found=0
+    for w in $wanted; do [[ $w == $h ]] && { found=1; break } done
+    if (( ! found )); then
+      out=$(pmset schedule cancel wake "$h" "$SCHED_OWNER" 2>&1) || log "could not cancel wake $h: $out"
+      log "wake cancelled: $h"
+    fi
+  done
+  for w in $wanted; do
+    found=0
+    for h in $have; do [[ $w == $h ]] && { found=1; break } done
+    if (( ! found )); then
+      out=$(pmset schedule wake "$w" "$SCHED_OWNER" 2>&1)
+      if [[ -n $out ]]; then log "could not schedule wake $w: $out"; else log "wake scheduled: $w"; fi
+    fi
+  done
+  (( soonest > 0 )) && next_wake=$(strftime '%a %H:%M' $soonest) || next_wake=
 }
 
 # A Mac with no battery (any desktop) reports no percentage at all, which reads
@@ -242,7 +290,7 @@ write_state() {
     print -r -- "idle_window=$IDLE_WINDOW"
     print -r -- "remind_every=$REMIND_EVERY"
     print -r -- "battery_floor=$BATTERY_FLOOR"
-    print -r -- "wake_daily=$WAKE_DAILY"
+    print -r -- "next_wake=$next_wake"
     print -r -- "match=$MATCH"
     print -r -- "holder_names=${holder_names:-}"
     print -r -- "off=$( [[ -f $STATE_DIR/disabled ]] && print 1 || print 0 )"
@@ -274,7 +322,7 @@ while true; do
   fi
 
   load_config
-  apply_wake_schedule
+  reconcile_schedule $now
   read_battery
 
   holders=$(pgrep -x $MATCH 2>/dev/null | wc -l | tr -d ' ')

@@ -13,6 +13,7 @@ STATE_DIR=$HOME/.stayawake
 STATE=$STATE_DIR/state
 LEASE=$STATE_DIR/lease
 VETO=$STATE_DIR/veto
+SCHEDULE=$STATE_DIR/schedule
 LOG=/var/log/stayawaked.log
 CONFIG=$STATE_DIR/config
 POLL=5
@@ -59,7 +60,7 @@ sleep_disabled() {
 load_state() {
   s_updated=0 s_demand=0 s_holders=0 s_manual=0 s_veto=0 s_latched= \
   s_hold_since=0 s_idle_since=0 s_battery_pct=? s_battery_state=? \
-  s_idle_window=3600 s_remind_every=0 s_battery_floor=0 s_wake_daily= s_match=caffeinate
+  s_idle_window=3600 s_remind_every=0 s_battery_floor=0 s_next_wake= s_match=caffeinate
   [[ -r $STATE ]] || return 1
   local k v
   while IFS='=' read -r k v; do
@@ -69,7 +70,7 @@ load_state() {
       (hold_since) s_hold_since=$v ;; (idle_since) s_idle_since=$v ;;
       (battery_pct) s_battery_pct=$v ;; (battery_state) s_battery_state=$v ;;
       (idle_window) s_idle_window=$v ;; (remind_every) s_remind_every=$v ;;
-      (battery_floor) s_battery_floor=$v ;; (wake_daily) s_wake_daily=$v ;;
+      (battery_floor) s_battery_floor=$v ;; (next_wake) s_next_wake=$v ;;
       (match) s_match=$v ;;
     esac
   done < $STATE
@@ -169,7 +170,7 @@ cmd_status() {
     print -r -- "  you asked:     let it sleep, even while work is running"
   fi
 
-  [[ -n $s_wake_daily ]] && print -r -- "  daily wake:    this Mac wakes itself at $s_wake_daily"
+  [[ -n $s_next_wake ]] && print -r -- "  next wake:     this Mac wakes itself $s_next_wake"
   case $s_latched in
     (battery) print -r -- "  battery limit: the battery got too low, so it stopped keeping the Mac awake. It starts again once you plug in or charge past $(( s_battery_floor + 5 ))%." ;;
   esac
@@ -235,6 +236,31 @@ cmd_let_sleep() {
   (( s_holders > 0 )) && print -r -- "It will sleep on lid close even though ${s_holders} thing(s) are working."
 }
 
+cmd_schedule() {
+  local line time days out d
+  if [[ ! -s $SCHEDULE ]]; then
+    print -r -- "No wake times set. Add them in the Schedule tab of the Stay Awake app."
+    return
+  fi
+  print -r -- "This Mac wakes itself at:"
+  while IFS= read -r line; do
+    line=${line%%\#*}
+    [[ -z ${line//[[:space:]]/} ]] && continue
+    time=${${(z)line}[1]}
+    days=${${(z)line}[2]}
+    out=
+    for d in ${(s::)days}; do
+      case $d in
+        (M) out="$out Mon" ;; (T) out="$out Tue" ;; (W) out="$out Wed" ;; (R) out="$out Thu" ;;
+        (F) out="$out Fri" ;; (S) out="$out Sat" ;; (U) out="$out Sun" ;;
+      esac
+    done
+    print -r -- "  $time on${out}"
+  done < $SCHEDULE
+  load_state
+  [[ -n $s_next_wake ]] && print -r -- "Next: $s_next_wake"
+}
+
 cmd_toggle() {
   local short=${1:-} wait=${2:-}
   load_state
@@ -273,6 +299,7 @@ case $cmd in
   (auto|off|unveto)      cmd_auto ;;
   (let-sleep|sleep-now|veto) cmd_let_sleep "${1:-}" ;;
   (toggle)               cmd_toggle "${1:-}" "${2:-}" ;;
+  (schedule|wake)        cmd_schedule ;;
   (log)                  tail -n ${1:-20} $LOG ;;
   (settings|config)      ${EDITOR:-vi} $CONFIG ;;
   (-h|--help|help)
@@ -284,6 +311,7 @@ case $cmd in
     print -r -- "  stayawake let-sleep [1h]   let it sleep even though work is running"
     print -r -- "  stayawake auto             back to automatic (undoes both of the above)"
     print -r -- "  stayawake toggle           flip whatever is set now; this is what the app does"
+    print -r -- "  stayawake schedule         times this Mac wakes itself (edit them in the app)"
     print -r -- "  stayawake log [20]         what it did recently"
     print -r -- "  stayawake settings         change the time limit, battery limit and alerts"
     print -r -- ""
