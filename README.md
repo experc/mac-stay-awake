@@ -78,7 +78,7 @@ boot. A crash while holding cannot leave a Mac permanently unable to sleep.
 Needs macOS 14 or newer and the command line tools (`xcode-select --install`), which provide the
 Swift compiler for the menu bar app. The installer checks both and stops if either is missing.
 
-    git clone <this repo>
+    git clone https://github.com/experc/mac-stay-awake.git
     cd mac-stay-awake
     ./install.sh
 
