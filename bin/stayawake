@@ -1,0 +1,269 @@
+#!/bin/zsh
+#
+# stayawake - talk to the helper, which owns `pmset disablesleep`.
+#
+# Nothing here needs a password: the helper does the privileged half, this just
+# reads its state file and drops small marker files it picks up on its next check.
+#
+emulate -L zsh
+set -u
+zmodload zsh/datetime
+
+STATE_DIR=$HOME/.stayawake
+STATE=$STATE_DIR/state
+LEASE=$STATE_DIR/lease
+VETO=$STATE_DIR/veto
+LOG=/var/log/stayawaked.log
+CONFIG=$STATE_DIR/config
+POLL=5
+DEFAULT_LEASE=2h
+DEFAULT_VETO=1h
+
+mkdir -p $STATE_DIR
+
+parse_dur() {
+  local s=$1
+  case $s in
+    (forever|inf|off) print 0 ;;
+    (<->h) print $(( ${s%h} * 3600 )) ;;
+    (<->m) print $(( ${s%m} * 60 )) ;;
+    (<->s) print ${s%s} ;;
+    (<->)  print $(( $s * 60 )) ;;
+    (*) print -u2 "stayawake: I did not understand the time '$s'. Try 90m, 2h, or forever."; return 1 ;;
+  esac
+}
+
+human() {
+  local s=$1
+  (( s < 0 )) && s=0
+  if (( s >= 3600 )); then printf '%dh %02dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+  elif (( s >= 60 )); then printf '%dm' $(( s / 60 ))
+  else printf '%ds' $s; fi
+}
+
+at_time() { strftime '%H:%M' $1 }
+
+sleep_disabled() {
+  ioreg -r -d 1 -c IOPMrootDomain 2>/dev/null | grep -q '"SleepDisabled" = Yes' && print 1 || print 0
+}
+
+load_state() {
+  s_updated=0 s_demand=0 s_holders=0 s_manual=0 s_veto=0 s_latched= \
+  s_hold_since=0 s_idle_since=0 s_battery_pct=? s_battery_state=? \
+  s_max_hold=0 s_battery_floor=0 s_grace=0 s_match=caffeinate
+  [[ -r $STATE ]] || return 1
+  local k v
+  while IFS='=' read -r k v; do
+    case $k in
+      (updated) s_updated=$v ;; (demand) s_demand=$v ;; (holders) s_holders=$v ;;
+      (manual) s_manual=$v ;; (veto) s_veto=$v ;; (latched) s_latched=$v ;;
+      (hold_since) s_hold_since=$v ;; (idle_since) s_idle_since=$v ;;
+      (battery_pct) s_battery_pct=$v ;; (battery_state) s_battery_state=$v ;;
+      (max_hold) s_max_hold=$v ;; (battery_floor) s_battery_floor=$v ;;
+      (grace) s_grace=$v ;; (match) s_match=$v ;;
+    esac
+  done < $STATE
+  return 0
+}
+
+# Names of the programs currently asking to stay awake, e.g. "claude claude".
+holder_list() {
+  local pid ppid pcomm out=
+  for pid in ${(f)"$(pgrep -x ${s_match:-caffeinate} 2>/dev/null)"}; do
+    [[ -z $pid ]] && continue
+    ppid=$(ps -o ppid= -p $pid 2>/dev/null | tr -d ' ')
+    pcomm=$(ps -o comm= -p $ppid 2>/dev/null | tr -d ' ')
+    pcomm=${pcomm:t}
+    out="$out ${pcomm:-something}"
+  done
+  print -r -- ${out# }
+}
+
+power_words() {
+  if [[ $s_battery_state == discharging ]]; then print -r -- "${s_battery_pct}%, on battery"
+  else print -r -- "${s_battery_pct}%, on power"; fi
+}
+
+marker_expiry() {
+  local f=$1
+  [[ -f $f ]] || { print -- -1; return }
+  local e=$(<$f) 2>/dev/null
+  [[ $e == <-> ]] || e=0
+  print -- $e
+}
+
+daemon_alive() {
+  (( s_updated > 0 && EPOCHSECONDS - s_updated < POLL * 4 ))
+}
+
+cmd_status() {
+  local short=${1:-}
+  load_state
+  local now=$EPOCHSECONDS disabled=$(sleep_disabled)
+  local lease_exp=$(marker_expiry $LEASE) veto_exp=$(marker_expiry $VETO)
+  local holders=$(holder_list)
+
+  if [[ $short == --short ]]; then
+    if (( disabled )); then
+      if (( s_holders > 0 )); then print -r -- "staying awake, ${s_holders} working. Battery $(power_words)."
+      else print -r -- "staying awake because you asked. Battery $(power_words)."; fi
+    else
+      print -r -- "sleeping normally. Battery $(power_words)."
+    fi
+    daemon_alive || print -r -- "WARNING: the helper is not running."
+    return
+  fi
+
+  if (( disabled )); then
+    print -r -- "The Mac is being KEPT AWAKE. Closing the lid will not put it to sleep."
+  else
+    print -r -- "The Mac will SLEEP normally. Closing the lid puts it to sleep."
+  fi
+  print -r -- ""
+
+  if ! daemon_alive; then
+    if (( s_updated == 0 )); then
+      print -r -- "  The helper is not running, so nothing is managing sleep right now."
+    else
+      print -r -- "  The helper stopped $(human $(( now - s_updated ))) ago, so nothing is managing sleep."
+    fi
+    print -r -- "  To start it again:  sudo launchctl kickstart -k system/com.macstayawake.helper"
+    return 1
+  fi
+
+  if (( s_holders > 0 )); then
+    print -r -- "  working now:   ${s_holders} (${holders})"
+  else
+    print -r -- "  working now:   nothing"
+  fi
+
+  if (( s_hold_since > 0 )); then
+    print -r -- "  kept awake:    $(human $(( now - s_hold_since ))) so far, and it stops after $(human $s_max_hold) whatever happens"
+  fi
+  if (( s_idle_since > 0 )); then
+    print -r -- "  sleep in:      $(human $(( s_grace - (now - s_idle_since) ))), a short wait in case work starts again"
+  fi
+
+  print -r -- "  battery:       $(power_words), and it stops keeping awake below ${s_battery_floor}%"
+
+  if (( lease_exp > 0 )); then
+    print -r -- "  you asked:     keep awake until $(at_time $lease_exp)"
+  elif (( lease_exp == 0 )); then
+    print -r -- "  you asked:     keep awake with no end time"
+  fi
+  if (( veto_exp > 0 )); then
+    print -r -- "  you asked:     let it sleep until $(at_time $veto_exp), even while work is running"
+  elif (( veto_exp == 0 )); then
+    print -r -- "  you asked:     let it sleep, even while work is running"
+  fi
+
+  case $s_latched in
+    (battery) print -r -- "  safety limit:  battery got too low, so it stopped keeping the Mac awake. It will start again once you plug in or charge past $(( s_battery_floor + 5 ))%." ;;
+    (deadline) print -r -- "  safety limit:  it had been awake for $(human $s_max_hold), so it stopped. It will start again after the current work finishes." ;;
+  esac
+}
+
+# Waits for the helper to actually apply a change, so the app can report the
+# truth instead of the state from a moment ago.
+wait_applied() {
+  local want=$1 i
+  for i in {1..14}; do
+    sleep 1
+    [[ $(sleep_disabled) == $want ]] && return 0
+  done
+  return 1
+}
+
+cmd_keep() {
+  local d=$(parse_dur ${1:-$DEFAULT_LEASE}) || return 1
+  rm -f $VETO
+  if (( d > 0 )); then
+    print -- $(( EPOCHSECONDS + d )) > $LEASE
+    print -r -- "Keeping the Mac awake until $(at_time $(( EPOCHSECONDS + d )))."
+  else
+    print -- 0 > $LEASE
+    print -r -- "Keeping the Mac awake with no end time. Run 'stayawake auto' when you are done."
+  fi
+  print -r -- "Closing the lid will not put it to sleep."
+}
+
+cmd_auto() {
+  load_state
+  rm -f $LEASE $VETO
+  print -r -- "Back to automatic."
+  if (( s_holders > 0 )); then
+    print -r -- "${s_holders} thing(s) are working, so the Mac stays awake until they finish."
+  else
+    print -r -- "Nothing is working, so the Mac will sleep normally."
+  fi
+}
+
+cmd_let_sleep() {
+  local d=$(parse_dur ${1:-$DEFAULT_VETO}) || return 1
+  load_state
+  rm -f $LEASE
+  if (( d > 0 )); then
+    print -- $(( EPOCHSECONDS + d )) > $VETO
+    print -r -- "The Mac may sleep normally until $(at_time $(( EPOCHSECONDS + d )))."
+  else
+    print -- 0 > $VETO
+    print -r -- "The Mac may sleep normally until you run 'stayawake auto'."
+  fi
+  (( s_holders > 0 )) && print -r -- "It will sleep on lid close even though ${s_holders} thing(s) are working."
+}
+
+cmd_toggle() {
+  local short=${1:-} wait=${2:-}
+  load_state
+  local lease_exp=$(marker_expiry $LEASE) veto_exp=$(marker_expiry $VETO) msg expect
+  if (( veto_exp >= 0 )); then
+    rm -f $VETO
+    if (( s_holders > 0 )); then
+      msg="Back to automatic. The Mac stays awake while ${s_holders} thing(s) are working."; expect=1
+    else
+      msg="Back to automatic. Nothing is working, so the Mac will sleep normally."; expect=0
+    fi
+  elif (( lease_exp >= 0 )); then
+    rm -f $LEASE
+    if (( s_holders > 0 )); then
+      msg="Your keep-awake is off, but ${s_holders} thing(s) are working, so the Mac stays awake."; expect=1
+    else
+      msg="Keep-awake is off. The Mac will sleep normally again."; expect=0
+    fi
+  elif (( s_holders > 0 )); then
+    print -- $(( EPOCHSECONDS + $(parse_dur $DEFAULT_VETO) )) > $VETO
+    msg="Sleep allowed for 1 hour. The Mac will sleep on lid close even though ${s_holders} thing(s) are working."; expect=0
+  else
+    print -- $(( EPOCHSECONDS + $(parse_dur $DEFAULT_LEASE) )) > $LEASE
+    msg="Keeping the Mac awake for 2 hours. Closing the lid will not put it to sleep."; expect=1
+  fi
+  [[ $wait == --wait || $short == --wait ]] && wait_applied $expect
+  print -r -- "$msg"
+}
+
+cmd=${1:-status}
+(( $# )) && shift
+
+case $cmd in
+  (status|st)            cmd_status "${1:-}" ;;
+  (keep|on|hold)         cmd_keep "${1:-}" ;;
+  (auto|off|unveto)      cmd_auto ;;
+  (let-sleep|sleep-now|veto) cmd_let_sleep "${1:-}" ;;
+  (toggle)               cmd_toggle "${1:-}" "${2:-}" ;;
+  (log)                  tail -n ${1:-20} $LOG ;;
+  (settings|config)      ${EDITOR:-vi} $CONFIG ;;
+  (-h|--help|help)
+    print -r -- "stayawake - keeps this Mac awake while work is running, even with the lid closed"
+    print -r -- ""
+    print -r -- "  stayawake                  show what is going on"
+    print -r -- "  stayawake keep [2h]        keep it awake yourself (default 2h, or 'forever')"
+    print -r -- "  stayawake let-sleep [1h]   let it sleep even though work is running"
+    print -r -- "  stayawake auto             back to automatic (undoes both of the above)"
+    print -r -- "  stayawake toggle           flip whatever is set now; this is what the app does"
+    print -r -- "  stayawake log [20]         what it did recently"
+    print -r -- "  stayawake settings         change the time limit, battery limit and alerts"
+    print -r -- ""
+    print -r -- "Automatic means: awake while Claude (or anything else) is working, normal sleep once it stops."
+    ;;
+  (*) print -u2 "stayawake: I do not know the command '$cmd'. Try: stayawake --help"; exit 2 ;;
+esac

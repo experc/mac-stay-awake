@@ -1,0 +1,329 @@
+#!/bin/zsh
+#
+# stayawaked - keeps a Mac awake, lid closed included, while work is in progress.
+#
+# macOS honours caffeinate's PreventUserIdleSystemSleep assertion only while the
+# lid is open; closing the lid sleeps regardless. The only switch that survives a
+# lid close is `pmset disablesleep`, which needs root and persists across reboots.
+# So this helper owns that switch and mirrors the assertions the system already
+# tracks: while at least one caffeinate process exists, sleep is disabled; once
+# the last one goes away and the grace period passes, it is enabled again.
+#
+# Tools that do long work already take that assertion. Claude Code, for one,
+# spawns `caffeinate -i -t 300` as a child of each session that is actively
+# working and renews it, so parallel sessions, and sessions that spawn other
+# sessions, reference-count themselves for free. The grace period exists because
+# the assertion is dropped and re-taken between renewals.
+#
+# Guardrails, all latched so a fired guardrail cannot immediately re-arm:
+#   MAX_HOLD       stop holding after this many seconds of continuous hold
+#   BATTERY_FLOOR  stop holding when discharging at or below this percentage
+#   GRACE          wait this long after work ends before allowing sleep again
+#
+emulate -L zsh
+set -u
+zmodload zsh/datetime
+
+LOG=/var/log/stayawaked.log
+
+# Filled in by resolve_user(), which follows whoever is logged in rather than
+# baking in a name, so the same helper works on any Mac and any account.
+USER_NAME=
+USER_ID=
+STATE_DIR=
+CONFIG=
+STATE=
+LEASE=
+VETO=
+
+# Defaults. Anything here can be overridden per machine in the config file.
+POLL=5
+MAX_HOLD=28800
+BATTERY_FLOOR=15
+GRACE=900
+NOTIFY=all
+MATCH=caffeinate
+
+log() {
+  print -r -- "$(strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS) $*" >> $LOG
+  chmod 644 $LOG 2>/dev/null
+  if [[ -f $LOG ]] && (( $(stat -f %z $LOG) > 524288 )); then
+    mv -f $LOG $LOG.1
+  fi
+}
+
+write_defaults() {
+  cat > $CONFIG <<'CONF'
+# Settings for stayawake. The menu bar app writes this file, and the helper
+# re-reads it every few seconds, so changes take effect without a restart.
+
+POLL=5              # seconds between checks
+MAX_HOLD=28800      # 8h: stop keeping awake after this much continuous hold
+BATTERY_FLOOR=15    # %: stop keeping awake when discharging at or below this
+GRACE=900           # 15m: wait this long after work ends before allowing sleep
+NOTIFY=all          # all | forced | none
+MATCH=caffeinate    # process name that counts as work in progress
+CONF
+  chown $USER_NAME $CONFIG 2>/dev/null
+  chmod 644 $CONFIG 2>/dev/null
+}
+
+# Follows the logged-in GUI user. Returns 1 when nobody is logged in, which is
+# normal at the login window and means there is nothing to manage yet.
+resolve_user() {
+  local u home
+  u=$(stat -f %Su /dev/console 2>/dev/null)
+  if [[ -z $u || $u == root || $u == _* ]]; then
+    [[ -n $USER_NAME ]] && log "nobody logged in, standing by"
+    USER_NAME= USER_ID= STATE_DIR=
+    return 1
+  fi
+  if [[ $u != $USER_NAME ]]; then
+    USER_NAME=$u
+    USER_ID=$(id -u $u 2>/dev/null)
+    home=$(dscl . -read /Users/$u NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    [[ -z $home ]] && home=/Users/$u
+    STATE_DIR=$home/.stayawake
+    CONFIG=$STATE_DIR/config
+    STATE=$STATE_DIR/state
+    LEASE=$STATE_DIR/lease
+    VETO=$STATE_DIR/veto
+    if [[ ! -d $STATE_DIR ]]; then
+      mkdir -p $STATE_DIR
+      chown $USER_NAME $STATE_DIR 2>/dev/null
+    fi
+    [[ -f $CONFIG ]] || write_defaults
+    log "following user $u"
+  fi
+  return 0
+}
+
+# The config is user writable and this runs as root, so it is parsed, never
+# sourced: only known keys, and every value validated and clamped.
+load_config() {
+  [[ -n $CONFIG && -r $CONFIG ]] || return
+  local line key val
+  while IFS= read -r line; do
+    line=${line%%\#*}
+    line=${line//[[:space:]]/}
+    [[ -z $line || $line != *=* ]] && continue
+    key=${line%%=*}
+    val=${line#*=}
+    case $key in
+      (POLL)          [[ $val == <-> ]] && (( val >= 2 && val <= 300 ))      && POLL=$val ;;
+      (MAX_HOLD)      [[ $val == <-> ]] && (( val >= 60 && val <= 604800 ))  && MAX_HOLD=$val ;;
+      (BATTERY_FLOOR) [[ $val == <-> ]] && (( val >= 0 && val <= 95 ))       && BATTERY_FLOOR=$val ;;
+      (GRACE)         [[ $val == <-> ]] && (( val >= 0 && val <= 7200 ))     && GRACE=$val ;;
+      (NOTIFY)        [[ $val == (all|forced|none) ]]                        && NOTIFY=$val ;;
+      (MATCH)         [[ $val =~ '^[A-Za-z0-9_.-]+$' ]]                      && MATCH=$val ;;
+    esac
+  done < $CONFIG
+}
+
+# The menu bar app posts its own notifications, so that clicking one opens the
+# app rather than whatever tool the helper would have used.
+app_running() {
+  local hb=$STATE_DIR/app-alive t
+  [[ -f $hb ]] || return 1
+  t=$(<$hb) 2>/dev/null
+  [[ $t == <-> ]] || return 1
+  (( EPOCHSECONDS - t < 15 ))
+}
+
+# $1 = class (transition|forced), $2 = message.
+notify() {
+  [[ $NOTIFY == none || -z $USER_ID ]] && return
+  app_running && return
+  [[ $NOTIFY == forced && $1 != forced ]] && return
+  local msg=${2//\"/}
+  launchctl asuser $USER_ID sudo -u $USER_NAME /usr/bin/osascript \
+    -e "display notification \"$msg\" with title \"Stay Awake\"" >/dev/null 2>&1
+}
+
+sleep_disabled() {
+  if ioreg -r -d 1 -c IOPMrootDomain 2>/dev/null | grep -q '"SleepDisabled" = Yes'; then
+    print 1
+  else
+    print 0
+  fi
+}
+
+apply() {
+  local want=$1 why=$2
+  local cur=$(sleep_disabled)
+  [[ $cur == $want ]] && return
+  pmset -a disablesleep $want
+  if [[ $want == 1 ]]; then
+    log "keeping awake ($why)"
+    notify transition "Keeping the Mac awake: $why"
+  else
+    log "back to normal sleep ($why)"
+    notify transition "Back to normal sleep: $why"
+  fi
+}
+
+# A Mac with no battery (any desktop) reports no percentage at all, which reads
+# as 100% on mains, so the battery guardrail simply never fires there.
+battery_pct=100
+battery_state=ac
+read_battery() {
+  local out=$(pmset -g batt 2>/dev/null)
+  battery_pct=${$(print -r -- $out | grep -oE '[0-9]+%' | head -1)%\%}
+  [[ -z $battery_pct ]] && battery_pct=100
+  if print -r -- $out | grep -q 'discharging'; then
+    battery_state=discharging
+  else
+    battery_state=ac
+  fi
+}
+
+# Reads an expiry file. 0 means no expiry; a past timestamp clears the file.
+active_marker() {
+  local f=$1 now=$2 exp
+  [[ -f $f ]] || { print 0; return }
+  exp=$(<$f) 2>/dev/null
+  [[ $exp == <-> ]] || exp=0
+  if (( exp == 0 || exp > now )); then print 1; else rm -f $f; print 0; fi
+}
+
+write_state() {
+  local d=$1 h=$2 m=$3 v=$4
+  [[ -n $STATE ]] || return
+  {
+    print -r -- "updated=$EPOCHSECONDS"
+    print -r -- "sleep_disabled=$(sleep_disabled)"
+    print -r -- "demand=$d"
+    print -r -- "holders=$h"
+    print -r -- "manual=$m"
+    print -r -- "veto=$v"
+    print -r -- "latched=$latched"
+    print -r -- "hold_since=$hold_since"
+    print -r -- "idle_since=$idle_since"
+    print -r -- "battery_pct=$battery_pct"
+    print -r -- "battery_state=$battery_state"
+    print -r -- "max_hold=$MAX_HOLD"
+    print -r -- "battery_floor=$BATTERY_FLOOR"
+    print -r -- "grace=$GRACE"
+    print -r -- "match=$MATCH"
+    print -r -- "holder_names=${holder_names:-}"
+    print -r -- "off=$( [[ -f $STATE_DIR/disabled ]] && print 1 || print 0 )"
+  } > $STATE.tmp && mv -f $STATE.tmp $STATE
+  chmod 644 $STATE 2>/dev/null
+}
+
+hold_since=0
+idle_since=0
+latched=
+prev_manual=0
+holder_names=
+hp= hpp= hname=
+
+log "stayawaked starting"
+
+# Boot reset: disablesleep survives reboots, so a crash while holding would
+# otherwise leave the Mac permanently unable to sleep with no visible cause.
+apply 0 "boot reset"
+
+while true; do
+  now=$EPOCHSECONDS
+
+  if ! resolve_user; then
+    apply 0 "nobody logged in"
+    sleep $POLL
+    continue
+  fi
+
+  load_config
+  read_battery
+
+  holders=$(pgrep -x $MATCH 2>/dev/null | wc -l | tr -d ' ')
+  holder_names=
+  if (( holders > 0 )); then
+    for hp in ${(f)"$(pgrep -x $MATCH 2>/dev/null)"}; do
+      hpp=$(ps -o ppid= -p $hp 2>/dev/null | tr -d ' ')
+      hname=$(ps -o comm= -p $hpp 2>/dev/null | tr -d ' ')
+      holder_names="$holder_names ${${hname:t}:-something}"
+    done
+    holder_names=${holder_names# }
+  fi
+  manual=$(active_marker $LEASE $now)
+  veto=$(active_marker $VETO $now)
+
+  demand=0
+  (( holders > 0 || manual )) && demand=1
+
+  # Master switch, owned by the app's ON/OFF toggle.
+  if [[ -f $STATE_DIR/disabled ]]; then
+    apply 0 "turned off"
+    hold_since=0; idle_since=0; latched=; prev_manual=$manual
+    write_state 0 0 0 0
+    sleep $POLL
+    continue
+  fi
+
+  # Latch clearing first, so a guardrail releases as soon as its cause is gone.
+  if [[ $latched == battery ]]; then
+    if [[ $battery_state != discharging ]] || (( battery_pct > BATTERY_FLOOR + 5 )); then
+      log "battery limit cleared (${battery_pct}% $battery_state)"
+      latched=
+    fi
+  elif [[ $latched == deadline ]]; then
+    if (( ! demand )); then
+      log "time limit cleared (work ended)"
+      latched=
+    fi
+  fi
+
+  # Guardrails.
+  if (( demand )) && [[ -z $latched ]]; then
+    if [[ $battery_state == discharging ]] && (( battery_pct <= BATTERY_FLOOR )); then
+      latched=battery
+      log "LIMIT battery: ${battery_pct}% discharging, letting it sleep again"
+      notify forced "Battery ${battery_pct}%, so the Mac can sleep again even though work is running"
+    elif (( hold_since > 0 && now - hold_since >= MAX_HOLD )); then
+      latched=deadline
+      log "LIMIT time: kept awake $((now - hold_since))s, letting it sleep again"
+      notify forced "Awake for $((MAX_HOLD / 3600))h, so the Mac can sleep again even though work is running"
+    fi
+  fi
+
+  want=0
+  (( demand && ! veto )) && [[ -z $latched ]] && want=1
+
+  if (( want )); then
+    idle_since=0
+    (( hold_since == 0 )) && hold_since=$now
+    if (( manual && holders == 0 )); then
+      apply 1 "you asked for it"
+    else
+      apply 1 "$holders working"
+    fi
+  else
+    if [[ -n $latched ]]; then
+      apply 0 "$latched limit reached"
+      hold_since=0; idle_since=0
+    elif (( veto )); then
+      apply 0 "you asked for it"
+      hold_since=0; idle_since=0
+    elif (( prev_manual && ! manual && holders == 0 )); then
+      # You turned the manual hold off yourself, so release straight away.
+      apply 0 "you asked for it"
+      hold_since=0; idle_since=0
+    elif (( hold_since > 0 )); then
+      # Work ended on its own: wait out the grace period before releasing, since
+      # a working session briefly drops its assertion between renewals.
+      (( idle_since == 0 )) && { idle_since=$now; log "work finished, waiting ${GRACE}s before allowing sleep" }
+      if (( now - idle_since >= GRACE )); then
+        apply 0 "work finished"
+        hold_since=0; idle_since=0
+      fi
+    else
+      apply 0 "nothing working"
+    fi
+  fi
+
+  write_state $demand $holders $manual $veto
+
+  prev_manual=$manual
+  sleep $POLL
+done
