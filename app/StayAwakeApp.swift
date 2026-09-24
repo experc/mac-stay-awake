@@ -115,6 +115,7 @@ final class Model: ObservableObject {
     @Published var holdUntil = Calendar.current.date(from: DateComponents(hour: 8, minute: 0)) ?? Date()
     @Published var entries: [WakeEntry] = []
     @Published var leaseExpiry: Double = 0
+    @Published var vetoExpiry: Double = 0
 
     private var timer: Timer?
     private var lastDisabled: Bool?
@@ -157,6 +158,8 @@ final class Model: ObservableObject {
         s = new
 
         leaseExpiry = Double((try? String(contentsOf: Paths.lease, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+        vetoExpiry = Double((try? String(contentsOf: Paths.veto, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
 
         // Tells the helper an app is running, so it does not also post its own
@@ -316,11 +319,7 @@ final class Model: ObservableObject {
         if s.holders > 0 {
             let names = s.holderNames.isEmpty ? "" : " (\(s.holderNames.split(separator: " ").joined(separator: ", ")))"
             lines.append("\(s.holders) thing\(s.holders == 1 ? "" : "s") working now\(names)")
-        } else if s.manual {
-            lines.append(leaseExpiry > 0
-                ? "You set it to stay awake until \(clockString(leaseExpiry))"
-                : "You set it to stay awake until you switch it back")
-        } else {
+        } else if !s.manual {
             lines.append("Nothing is working right now")
         }
         if s.sleepDisabled && s.holdSince > 0 {
@@ -331,10 +330,24 @@ final class Model: ObservableObject {
             let left = Int((Double(s.idleWindow) - (Date().timeIntervalSince1970 - s.idleSince)) / 60)
             lines.append("Quiet so far. It sleeps in about \(max(0, left))m unless something starts.")
         }
-        if s.veto { lines.append("You allowed it to sleep, even while work is running") }
         if s.latched == "battery" { lines.append("Stopped: the battery is below \(s.batteryFloor)%") }
         lines.append("Battery \(s.batteryPct)%, \(s.onBattery ? "on battery" : "on power")")
         return lines.joined(separator: "\n")
+    }
+
+    /// Set by hand, so it needs an obvious way back. Nil when on automatic.
+    var manualSummary: String? {
+        if s.veto {
+            return vetoExpiry > 0
+                ? "You allowed it to sleep until \(clockString(vetoExpiry)), even while work is running"
+                : "You allowed it to sleep, even while work is running"
+        }
+        if s.manual {
+            return leaseExpiry > 0
+                ? "You set it to stay awake until \(clockString(leaseExpiry))"
+                : "You set it to stay awake until you turn this off"
+        }
+        return nil
     }
 
     var iconName: String {
@@ -363,6 +376,17 @@ struct NowTab: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if model.enabled, let summary = model.manualSummary {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(summary).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button("Cancel") { model.backToAutomatic() }
+                }
+                .padding(8)
+                .background(Color.secondary.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+
             if model.enabled {
                 Picker("", selection: Binding(
                     get: { model.mode },
@@ -373,7 +397,7 @@ struct NowTab: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
 
-                Caption("Automatic stays awake while something is working. The other two are yours to set and stay until you change them back.")
+                Caption("Automatic stays awake while something is working. The other two stay as you set them until you pick Automatic again, or press Cancel above.")
 
                 HStack(spacing: 6) {
                     Text("Keep awake until").font(.callout)
