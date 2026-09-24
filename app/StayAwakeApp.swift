@@ -1,9 +1,9 @@
 import SwiftUI
 import UserNotifications
 
-// The privileged half of this lives in /usr/local/sbin/nosleepd. This app never
-// touches pmset: it reads the daemon's state file and writes small files the
-// daemon picks up on its next check, which is why it needs no password.
+// The privileged half of this lives in /usr/local/sbin/stayawaked. This app
+// never touches pmset: it reads the helper's state file and writes small files
+// the helper picks up on its next check, which is why it needs no password.
 
 enum Paths {
     static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".stayawake")
@@ -27,9 +27,10 @@ struct Status {
     var idleSince: Double = 0
     var batteryPct = 0
     var batteryState = "ac"
-    var maxHold = 28800
+    var idleWindow = 3600
+    var remindEvery = 21600
     var batteryFloor = 15
-    var grace = 900
+    var wakeDaily = ""
     var off = false
 
     var daemonAlive: Bool { updated > 0 && Date().timeIntervalSince1970 - updated < 30 }
@@ -49,13 +50,25 @@ func readKeyValues(_ url: URL) -> [String: String] {
     return out
 }
 
+func shortDuration(_ seconds: Int) -> String {
+    if seconds >= 3600 {
+        let h = seconds / 3600, m = (seconds % 3600) / 60
+        return m == 0 ? "\(h)h" : "\(h)h \(m)m"
+    }
+    return "\(seconds / 60)m"
+}
+
 @MainActor
 final class Model: ObservableObject {
     @Published var s = Status()
-    @Published var maxHoldHours: Double = 8
+    @Published var idleWindowMinutes: Double = 60
+    @Published var remindEveryHours: Double = 6      // 0 means never
     @Published var batteryFloor: Double = 15
     @Published var notifyOn = true
     @Published var enabled = true
+    @Published var wakeEnabled = false
+    @Published var wakeTime = Calendar.current.date(from: DateComponents(hour: 8, minute: 0)) ?? Date()
+    @Published var holdUntil = Calendar.current.date(from: DateComponents(hour: 8, minute: 0)) ?? Date()
 
     private var timer: Timer?
     private var lastDisabled: Bool?
@@ -89,13 +102,14 @@ final class Model: ObservableObject {
         new.idleSince = Double(kv["idle_since"] ?? "") ?? 0
         new.batteryPct = Int(kv["battery_pct"] ?? "") ?? 0
         new.batteryState = kv["battery_state"] ?? "ac"
-        new.maxHold = Int(kv["max_hold"] ?? "") ?? 28800
+        new.idleWindow = Int(kv["idle_window"] ?? "") ?? 3600
+        new.remindEvery = Int(kv["remind_every"] ?? "") ?? 0
         new.batteryFloor = Int(kv["battery_floor"] ?? "") ?? 15
-        new.grace = Int(kv["grace"] ?? "") ?? 900
+        new.wakeDaily = kv["wake_daily"] ?? ""
         new.off = kv["off"] == "1"
         s = new
 
-        // Tells the daemon an app is running, so it does not also post its own
+        // Tells the helper an app is running, so it does not also post its own
         // notifications from osascript.
         try? String(Int(Date().timeIntervalSince1970)).write(to: Paths.heartbeat, atomically: true, encoding: .utf8)
 
@@ -117,37 +131,50 @@ final class Model: ObservableObject {
             content.title = "Back to normal sleep"
             switch s.latched {
             case "battery": content.body = "Battery got low, so the Mac can sleep again."
-            case "deadline": content.body = "It had been awake for a long time, so the Mac can sleep again."
-            default: content.body = s.off ? "Stay Awake is turned off." : "Nothing is working now."
+            default: content.body = s.off ? "Stay Awake is turned off." : "Everything has been quiet, so the Mac can sleep again."
             }
         }
-        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req)
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
 
     // MARK: settings
 
+    private func hhmm(_ date: Date) -> String {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return String(format: "%02d:%02d", c.hour ?? 0, c.minute ?? 0)
+    }
+
+    private func date(fromHHMM s: String) -> Date? {
+        let parts = s.split(separator: ":")
+        guard parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]) else { return nil }
+        return Calendar.current.date(from: DateComponents(hour: h, minute: m))
+    }
+
     func loadConfig() {
         let kv = readKeyValues(Paths.config)
-        if let v = Int(kv["MAX_HOLD"] ?? "") { maxHoldHours = max(1, Double(v) / 3600) }
+        if let v = Int(kv["IDLE_WINDOW"] ?? kv["GRACE"] ?? "") { idleWindowMinutes = max(15, Double(v) / 60) }
+        if let v = Int(kv["REMIND_EVERY"] ?? "") { remindEveryHours = Double(v) / 3600 }
         if let v = Int(kv["BATTERY_FLOOR"] ?? "") { batteryFloor = Double(v) }
         notifyOn = (kv["NOTIFY"] ?? "all") != "none"
+        let wake = kv["WAKE_DAILY"] ?? ""
+        wakeEnabled = !wake.isEmpty
+        if let d = date(fromHHMM: wake) { wakeTime = d }
     }
 
     func saveConfig() {
-        var kv = readKeyValues(Paths.config)
-        kv["MAX_HOLD"] = String(Int(maxHoldHours * 3600))
-        kv["BATTERY_FLOOR"] = String(Int(batteryFloor))
-        kv["NOTIFY"] = notifyOn ? "all" : "none"
+        let kv = readKeyValues(Paths.config)
         let text = """
-        # Settings for stayawake. The app writes this file; the helper re-reads it every few seconds.
+        # Settings for stayawake. The app writes this file; the helper re-reads it
+        # every few seconds, so changes take effect without a restart.
 
         POLL=\(kv["POLL"] ?? "5")
-        MAX_HOLD=\(kv["MAX_HOLD"]!)
-        BATTERY_FLOOR=\(kv["BATTERY_FLOOR"]!)
-        GRACE=\(kv["GRACE"] ?? "900")
-        NOTIFY=\(kv["NOTIFY"]!)
+        IDLE_WINDOW=\(Int(idleWindowMinutes * 60))
+        REMIND_EVERY=\(Int(remindEveryHours * 3600))
+        BATTERY_FLOOR=\(Int(batteryFloor))
+        NOTIFY=\(notifyOn ? "all" : "none")
         MATCH=\(kv["MATCH"] ?? "caffeinate")
+        WAKE_DAILY=\(wakeEnabled ? hhmm(wakeTime) : "")
 
         """
         try? text.write(to: Paths.config, atomically: true, encoding: .utf8)
@@ -162,6 +189,16 @@ final class Model: ObservableObject {
     func keepAwake(hours: Double?) {
         try? FileManager.default.removeItem(at: Paths.veto)
         write(Paths.lease, expiry: hours.map { Date().timeIntervalSince1970 + $0 * 3600 } ?? 0)
+    }
+
+    /// Holds until the next time it is that hour and minute, today or tomorrow.
+    func keepAwakeUntil(_ time: Date) {
+        let c = Calendar.current
+        let parts = c.dateComponents([.hour, .minute], from: time)
+        var target = c.date(bySettingHour: parts.hour ?? 8, minute: parts.minute ?? 0, second: 0, of: Date()) ?? Date()
+        if target <= Date() { target = c.date(byAdding: .day, value: 1, to: target) ?? target }
+        try? FileManager.default.removeItem(at: Paths.veto)
+        write(Paths.lease, expiry: target.timeIntervalSince1970)
     }
 
     func letSleep(hours: Double) {
@@ -205,18 +242,14 @@ final class Model: ObservableObject {
         }
         if s.sleepDisabled && s.holdSince > 0 {
             let mins = Int((Date().timeIntervalSince1970 - s.holdSince) / 60)
-            lines.append("Awake \(mins < 60 ? "\(mins)m" : "\(mins / 60)h \(mins % 60)m") so far, stops after \(s.maxHold / 3600)h")
+            lines.append("Awake \(mins < 60 ? "\(mins)m" : "\(mins / 60)h \(mins % 60)m") so far, no time limit")
         }
         if s.idleSince > 0 {
-            let left = Int((Double(s.grace) - (Date().timeIntervalSince1970 - s.idleSince)) / 60)
-            lines.append("Sleeping in about \(max(0, left))m")
+            let left = Int((Double(s.idleWindow) - (Date().timeIntervalSince1970 - s.idleSince)) / 60)
+            lines.append("Quiet: sleeping in about \(max(0, left))m unless work resumes")
         }
         if s.veto { lines.append("You asked to let it sleep") }
-        switch s.latched {
-        case "battery": lines.append("Stopped: battery below \(s.batteryFloor)%")
-        case "deadline": lines.append("Stopped: reached the \(s.maxHold / 3600)h limit")
-        default: break
-        }
+        if s.latched == "battery" { lines.append("Stopped: battery below \(s.batteryFloor)%") }
         lines.append("Battery \(s.batteryPct)%, \(s.onBattery ? "on battery" : "on power")")
         return lines.joined(separator: "\n")
     }
@@ -224,6 +257,14 @@ final class Model: ObservableObject {
     var iconName: String {
         if s.off || !s.daemonAlive { return "moon.zzz" }
         return s.sleepDisabled ? "eye.fill" : "moon"
+    }
+}
+
+struct Caption: View {
+    let text: String
+    var body: some View {
+        Text(text).font(.caption2).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -245,7 +286,8 @@ struct PanelView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(model.headline).font(.title3).fontWeight(.semibold)
-                Text(model.detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(model.detail).font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if model.enabled {
@@ -256,32 +298,74 @@ struct PanelView: View {
                         Button("for 4 hours") { model.keepAwake(hours: 4) }
                         Button("until I turn it off") { model.keepAwake(hours: nil) }
                     }
-                    .frame(width: 120)
+                    .frame(width: 118)
                     Button("Let it sleep") { model.letSleep(hours: 1) }
+                    if model.s.manual || model.s.veto {
+                        Button("Automatic") { model.backToAutomatic() }
+                    }
                 }
-                if model.s.manual || model.s.veto {
-                    Button("Back to automatic") { model.backToAutomatic() }
-                        .buttonStyle(.link)
+                HStack(spacing: 6) {
+                    Text("or until").font(.callout)
+                    DatePicker("", selection: $model.holdUntil, displayedComponents: .hourAndMinute)
+                        .labelsHidden().frame(width: 76)
+                    Button("Hold") { model.keepAwakeUntil(model.holdUntil) }
                 }
+                Caption(text: "For a run you start deliberately, holding until a set time is surer than relying on detection.")
             }
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Stop after").frame(width: 92, alignment: .leading)
-                    Slider(value: $model.maxHoldHours, in: 1...24, step: 1) { editing in
-                        if !editing { model.saveConfig() }
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text("Sleep when quiet for").frame(width: 130, alignment: .leading)
+                        Slider(value: $model.idleWindowMinutes, in: 15...240, step: 15) { editing in
+                            if !editing { model.saveConfig() }
+                        }
+                        Text(shortDuration(Int(model.idleWindowMinutes) * 60))
+                            .frame(width: 42, alignment: .trailing).monospacedDigit()
                     }
-                    Text("\(Int(model.maxHoldHours))h").frame(width: 32, alignment: .trailing).monospacedDigit()
+                    Caption(text: "Work stops and restarts constantly, so only this much continuous quiet counts as finished.")
                 }
-                HStack {
-                    Text("Battery limit").frame(width: 92, alignment: .leading)
-                    Slider(value: $model.batteryFloor, in: 5...80, step: 5) { editing in
-                        if !editing { model.saveConfig() }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text("Remind me every").frame(width: 130, alignment: .leading)
+                        Slider(value: $model.remindEveryHours, in: 0...24, step: 1) { editing in
+                            if !editing { model.saveConfig() }
+                        }
+                        Text(model.remindEveryHours == 0 ? "never" : "\(Int(model.remindEveryHours))h")
+                            .frame(width: 42, alignment: .trailing).monospacedDigit()
                     }
-                    Text("\(Int(model.batteryFloor))%").frame(width: 32, alignment: .trailing).monospacedDigit()
+                    Caption(text: "Nothing is ever cut off. This just tells you the Mac is still being kept awake.")
                 }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text("Battery limit").frame(width: 130, alignment: .leading)
+                        Slider(value: $model.batteryFloor, in: 5...80, step: 5) { editing in
+                            if !editing { model.saveConfig() }
+                        }
+                        Text("\(Int(model.batteryFloor))%")
+                            .frame(width: 42, alignment: .trailing).monospacedDigit()
+                    }
+                    Caption(text: "The one limit that does end a hold, so an unplugged Mac cannot run itself flat.")
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Toggle("Wake the Mac daily at", isOn: Binding(
+                            get: { model.wakeEnabled },
+                            set: { model.wakeEnabled = $0; model.saveConfig() }
+                        ))
+                        DatePicker("", selection: $model.wakeTime, displayedComponents: .hourAndMinute)
+                            .labelsHidden().frame(width: 76)
+                            .disabled(!model.wakeEnabled)
+                            .onChange(of: model.wakeTime) { model.saveConfig() }
+                    }
+                    Caption(text: "Sleep ends a run rather than pausing it. A daily wake gives overnight work a chance to resume.")
+                }
+
                 Toggle("Tell me when it changes", isOn: Binding(
                     get: { model.notifyOn },
                     set: { model.notifyOn = $0; model.saveConfig() }
@@ -295,11 +379,12 @@ struct PanelView: View {
                 Text(model.s.daemonAlive ? "Helper running" : "Helper not running")
                     .font(.caption).foregroundStyle(model.s.daemonAlive ? Color.secondary : Color.red)
                 Spacer()
+                Text("Quit closes this window only").font(.caption2).foregroundStyle(.secondary)
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.link).font(.caption)
             }
         }
         .padding(14)
-        .frame(width: 320)
+        .frame(width: 380)
     }
 }
 

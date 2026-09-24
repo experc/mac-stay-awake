@@ -11,25 +11,29 @@ assertion once the lid is shut.
 
     stayawake                  is it staying awake right now, and why
     stayawake keep 2h          keep it awake myself
+    stayawake keep until 08:00 keep it awake until a set time, for an overnight run
     stayawake let-sleep        let it sleep now, even though work is running
     stayawake auto             back to automatic
 
 There is also a menu bar app with the same controls and the settings:
 
-    ┌─────────────────────────────────┐
-    │ Stay Awake         [ ON  ●───]  │
-    │                                 │
-    │ Staying awake                   │
-    │ 2 things working (claude)       │
-    │ 14m so far, stops after 8h      │
-    │ Battery 76%, on power           │
-    │                                 │
-    │ [ Keep awake ▾ ] [ Let it sleep ]│
-    │                                 │
-    │ Stop after      ──────●──  8 h  │
-    │ Battery limit   ──●──────  15 % │
-    │ Tell me when it changes  [ ✓ ]  │
-    └─────────────────────────────────┘
+    ┌──────────────────────────────────────────┐
+    │ Stay Awake                  [ ON  ●───]  │
+    │                                          │
+    │ Staying awake                            │
+    │ 2 things working (claude, claude)        │
+    │ Awake 14m so far, no time limit          │
+    │ Battery 76%, on power                    │
+    │                                          │
+    │ [ Keep awake ▾ ] [ Let it sleep ]        │
+    │ or until [ 08:00 ] [ Hold ]              │
+    │                                          │
+    │ Sleep when quiet for  ──●─────  1h       │
+    │ Remind me every       ────●───  6h       │
+    │ Battery limit         ─●──────  15%      │
+    │ [✓] Wake the Mac daily at [ 07:30 ]      │
+    │ [✓] Tell me when it changes              │
+    └──────────────────────────────────────────┘
 
 ## How it decides
 
@@ -51,27 +55,66 @@ as a child and renews it while busy. Note that the *presence* of a tool is not t
 assertion: idle sessions can sit around for weeks, and holding the Mac awake for those would mean
 never sleeping again.
 
-## Safety limits
+## Quiet, not finished
 
-Nothing here can keep a Mac awake indefinitely by accident.
+The setting that matters most is the **quiet window**, and it exists because of one awkward fact:
+an assertion is dropped and re-taken constantly. Between two turns of an agent, between phases of a
+build, while one process waits on another, nothing is caffeinating at all. "No assertion right now"
+therefore does not mean "the work is finished", and only the LENGTH of the quiet period tells the
+two apart.
+
+So the rule is not "sleep when work stops". It is:
+
+    sleep only once EVERYTHING has been quiet for the whole window
+
+Any activity inside the window cancels the countdown, and the Mac stays awake. Real numbers from a
+machine running two Claude sessions: the assertion dropped to zero twice in 35 minutes of work that
+looked continuous from the outside. With a short window, that Mac would have slept mid-run.
+
+## Limits
 
 | setting | default | what it does |
 | --- | --- | --- |
-| `MAX_HOLD` | 8h | gives up after this much continuous hold, even if work continues |
-| `BATTERY_FLOOR` | 15% | gives up when discharging at or below this, even if work continues |
-| `GRACE` | 15m | waits this long after work ends before allowing sleep |
+| `IDLE_WINDOW` | 1h | everything must be quiet this long before sleep is allowed |
+| `REMIND_EVERY` | 6h | reminds you the Mac is still being kept awake. `0` disables it |
+| `BATTERY_FLOOR` | 15% | stops keeping awake when discharging at or below this |
+| `WAKE_DAILY` | off | `HH:MM` to wake this Mac every day |
 | `NOTIFY` | all | `all`, `forced` (limits only), or `none` |
 | `MATCH` | caffeinate | process name that counts as work in progress |
 
-The grace period is not padding: an assertion is typically re-taken every few minutes, and without
-it the Mac could sleep in the gap between two renewals.
+**There is deliberately no maximum hold.** A run that takes all weekend must not be cut off halfway
+because a timer expired. `REMIND_EVERY` replaces that protection: it tells you a hold is still
+active, without ending it, so a forgotten hold surfaces rather than being silently enforced.
 
-A limit that fires **latches**, so it cannot re-arm on the next check while the same work is still
-running. The time limit clears when the work ends; the battery limit clears on mains power or once
-the charge is more than 5 points above the floor.
+**The battery limit is the one thing that still ends a hold**, because an unplugged Mac held awake
+runs itself flat, and that failure is not recoverable by noticing it later. It latches, so it cannot
+re-arm on the next check, and clears on mains power or once the charge is comfortably above the
+floor. A desktop has no battery, reports 100% on mains, and so is never affected.
 
 `disablesleep` survives reboots, so the helper sets it back to `0` as its first action at every
 boot. A crash while holding cannot leave a Mac permanently unable to sleep.
+
+## Long runs and agent fleets
+
+If you start a long scenario, several agents working, communicating, and idling for long stretches
+while they wait on each other, there are two ways to keep the Mac up, and they are complementary.
+
+**Automatic**, with the quiet window set to cover the longest gap you expect between bursts of
+activity. Nothing to remember. The risk is that a gap longer than the window looks exactly like
+"finished".
+
+**Explicit**, with `stayawake keep until 08:00` or the app's *or until* row. Nothing is inferred, so
+no gap length can catch you out. This is the better choice for a run you deliberately start, and the
+two layers coexist: the explicit hold simply wins while it lasts.
+
+**Know this before relying on either: sleep ENDS a run, it does not pause it.** Local timers do not
+fire while a Mac is asleep, so an orchestration that expects to resume at 04:00 does not resume, it
+stops. If that matters, set a daily wake (`WAKE_DAILY`, or the checkbox in the app) so the machine
+comes back by itself and work can continue.
+
+`WAKE_DAILY` uses `pmset repeat`, which holds a single repeating schedule for the whole machine.
+Setting it here replaces any repeating power schedule you set up yourself, and turning it off
+cancels that schedule rather than restoring what was there before.
 
 ## Install
 

@@ -43,6 +43,15 @@ human() {
 
 at_time() { strftime '%H:%M' $1 }
 
+# "08:00" means the next time it is 08:00, today or tomorrow.
+until_epoch() {
+  local hhmm=$1 t
+  t=$(strftime -r '%Y-%m-%d %H:%M' "$(strftime '%Y-%m-%d' $EPOCHSECONDS) $hhmm" 2>/dev/null) || return 1
+  [[ -z $t ]] && return 1
+  (( t <= EPOCHSECONDS )) && t=$(( t + 86400 ))
+  print $t
+}
+
 sleep_disabled() {
   ioreg -r -d 1 -c IOPMrootDomain 2>/dev/null | grep -q '"SleepDisabled" = Yes' && print 1 || print 0
 }
@@ -50,7 +59,7 @@ sleep_disabled() {
 load_state() {
   s_updated=0 s_demand=0 s_holders=0 s_manual=0 s_veto=0 s_latched= \
   s_hold_since=0 s_idle_since=0 s_battery_pct=? s_battery_state=? \
-  s_max_hold=0 s_battery_floor=0 s_grace=0 s_match=caffeinate
+  s_idle_window=3600 s_remind_every=0 s_battery_floor=0 s_wake_daily= s_match=caffeinate
   [[ -r $STATE ]] || return 1
   local k v
   while IFS='=' read -r k v; do
@@ -59,8 +68,9 @@ load_state() {
       (manual) s_manual=$v ;; (veto) s_veto=$v ;; (latched) s_latched=$v ;;
       (hold_since) s_hold_since=$v ;; (idle_since) s_idle_since=$v ;;
       (battery_pct) s_battery_pct=$v ;; (battery_state) s_battery_state=$v ;;
-      (max_hold) s_max_hold=$v ;; (battery_floor) s_battery_floor=$v ;;
-      (grace) s_grace=$v ;; (match) s_match=$v ;;
+      (idle_window) s_idle_window=$v ;; (remind_every) s_remind_every=$v ;;
+      (battery_floor) s_battery_floor=$v ;; (wake_daily) s_wake_daily=$v ;;
+      (match) s_match=$v ;;
     esac
   done < $STATE
   return 0
@@ -138,10 +148,12 @@ cmd_status() {
   fi
 
   if (( s_hold_since > 0 )); then
-    print -r -- "  kept awake:    $(human $(( now - s_hold_since ))) so far, and it stops after $(human $s_max_hold) whatever happens"
+    print -r -- "  kept awake:    $(human $(( now - s_hold_since ))) so far, with no time limit"
   fi
   if (( s_idle_since > 0 )); then
-    print -r -- "  sleep in:      $(human $(( s_grace - (now - s_idle_since) ))), a short wait in case work starts again"
+    print -r -- "  sleep in:      $(human $(( s_idle_window - (now - s_idle_since) ))), unless work starts again"
+  else
+    print -r -- "  quiet window:  sleeps once everything has been quiet for $(human $s_idle_window)"
   fi
 
   print -r -- "  battery:       $(power_words), and it stops keeping awake below ${s_battery_floor}%"
@@ -157,9 +169,9 @@ cmd_status() {
     print -r -- "  you asked:     let it sleep, even while work is running"
   fi
 
+  [[ -n $s_wake_daily ]] && print -r -- "  daily wake:    this Mac wakes itself at $s_wake_daily"
   case $s_latched in
-    (battery) print -r -- "  safety limit:  battery got too low, so it stopped keeping the Mac awake. It will start again once you plug in or charge past $(( s_battery_floor + 5 ))%." ;;
-    (deadline) print -r -- "  safety limit:  it had been awake for $(human $s_max_hold), so it stopped. It will start again after the current work finishes." ;;
+    (battery) print -r -- "  battery limit: the battery got too low, so it stopped keeping the Mac awake. It starts again once you plug in or charge past $(( s_battery_floor + 5 ))%." ;;
   esac
 }
 
@@ -175,7 +187,18 @@ wait_applied() {
 }
 
 cmd_keep() {
-  local d=$(parse_dur ${1:-$DEFAULT_LEASE}) || return 1
+  local arg=${1:-$DEFAULT_LEASE} d until
+  # `keep until 08:00`, or just `keep 08:00`
+  [[ $arg == until ]] && arg=${2:-}
+  if [[ $arg == <->:<-> ]]; then
+    until=$(until_epoch $arg) || { print -u2 "stayawake: I did not understand the time '$arg'. Try 08:00."; return 1 }
+    rm -f $VETO
+    print -- $until > $LEASE
+    print -r -- "Keeping the Mac awake until $(at_time $until)."
+    print -r -- "Closing the lid will not put it to sleep."
+    return 0
+  fi
+  d=$(parse_dur $arg) || return 1
   rm -f $VETO
   if (( d > 0 )); then
     print -- $(( EPOCHSECONDS + d )) > $LEASE
@@ -246,7 +269,7 @@ cmd=${1:-status}
 
 case $cmd in
   (status|st)            cmd_status "${1:-}" ;;
-  (keep|on|hold)         cmd_keep "${1:-}" ;;
+  (keep|on|hold)         cmd_keep "${1:-}" "${2:-}" ;;
   (auto|off|unveto)      cmd_auto ;;
   (let-sleep|sleep-now|veto) cmd_let_sleep "${1:-}" ;;
   (toggle)               cmd_toggle "${1:-}" "${2:-}" ;;
@@ -257,13 +280,17 @@ case $cmd in
     print -r -- ""
     print -r -- "  stayawake                  show what is going on"
     print -r -- "  stayawake keep [2h]        keep it awake yourself (default 2h, or 'forever')"
+    print -r -- "  stayawake keep until 08:00 keep it awake until a time, for an overnight run"
     print -r -- "  stayawake let-sleep [1h]   let it sleep even though work is running"
     print -r -- "  stayawake auto             back to automatic (undoes both of the above)"
     print -r -- "  stayawake toggle           flip whatever is set now; this is what the app does"
     print -r -- "  stayawake log [20]         what it did recently"
     print -r -- "  stayawake settings         change the time limit, battery limit and alerts"
     print -r -- ""
-    print -r -- "Automatic means: awake while Claude (or anything else) is working, normal sleep once it stops."
+    print -r -- "Automatic means: awake while anything is working, and for as long as work keeps"
+    print -r -- "coming. Sleep is allowed only once EVERYTHING has been quiet for the whole quiet"
+    print -r -- "window (1h by default), because work stopping for a minute is not the same as work"
+    print -r -- "being finished. There is no maximum, so a long run is never cut off."
     ;;
   (*) print -u2 "stayawake: I do not know the command '$cmd'. Try: stayawake --help"; exit 2 ;;
 esac

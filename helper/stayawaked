@@ -6,19 +6,21 @@
 # lid is open; closing the lid sleeps regardless. The only switch that survives a
 # lid close is `pmset disablesleep`, which needs root and persists across reboots.
 # So this helper owns that switch and mirrors the assertions the system already
-# tracks: while at least one caffeinate process exists, sleep is disabled; once
-# the last one goes away and the grace period passes, it is enabled again.
+# tracks: while at least one caffeinate process exists, sleep is disabled.
 #
 # Tools that do long work already take that assertion. Claude Code, for one,
 # spawns `caffeinate -i -t 300` as a child of each session that is actively
-# working and renews it, so parallel sessions, and sessions that spawn other
-# sessions, reference-count themselves for free. The grace period exists because
-# the assertion is dropped and re-taken between renewals.
+# working and renews it, so parallel jobs, and jobs that spawn other jobs,
+# reference-count themselves for free.
 #
-# Guardrails, all latched so a fired guardrail cannot immediately re-arm:
-#   MAX_HOLD       stop holding after this many seconds of continuous hold
-#   BATTERY_FLOOR  stop holding when discharging at or below this percentage
-#   GRACE          wait this long after work ends before allowing sleep again
+# The central setting is IDLE_WINDOW. An assertion is dropped and re-taken
+# constantly (between turns, between phases, while one agent waits on another),
+# so "no assertion right now" does not mean "finished". Only the LENGTH of the
+# quiet period distinguishes the two, and IDLE_WINDOW is where that line is
+# drawn: everything must be quiet for that long before sleep is allowed.
+#
+# There is deliberately no maximum hold. Long runs must not be cut off midway.
+# REMIND_EVERY instead surfaces a hold that has been forgotten, without ending it.
 #
 emulate -L zsh
 set -u
@@ -38,11 +40,12 @@ VETO=
 
 # Defaults. Anything here can be overridden per machine in the config file.
 POLL=5
-MAX_HOLD=28800
+IDLE_WINDOW=3600
+REMIND_EVERY=21600
 BATTERY_FLOOR=15
-GRACE=900
 NOTIFY=all
 MATCH=caffeinate
+WAKE_DAILY=
 
 log() {
   print -r -- "$(strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS) $*" >> $LOG
@@ -58,11 +61,22 @@ write_defaults() {
 # re-reads it every few seconds, so changes take effect without a restart.
 
 POLL=5              # seconds between checks
-MAX_HOLD=28800      # 8h: stop keeping awake after this much continuous hold
+
+IDLE_WINDOW=3600    # 1h: everything must be quiet this long before sleep is allowed.
+                    # Work stops and starts constantly, so this is what separates
+                    # "between phases" from "finished". Raise it for long agent runs.
+
+REMIND_EVERY=21600  # 6h: remind me the Mac is still being kept awake. 0 = never.
+                    # Nothing is ever cut off; this only tells you it is happening.
+
 BATTERY_FLOOR=15    # %: stop keeping awake when discharging at or below this
-GRACE=900           # 15m: wait this long after work ends before allowing sleep
+
 NOTIFY=all          # all | forced | none
 MATCH=caffeinate    # process name that counts as work in progress
+
+WAKE_DAILY=         # HH:MM to wake this Mac every day, or empty for never.
+                    # Sleep ENDS a run rather than pausing it, so a scheduled
+                    # wake is how an overnight scenario gets a chance to resume.
 CONF
   chown $USER_NAME $CONFIG 2>/dev/null
   chmod 644 $CONFIG 2>/dev/null
@@ -110,12 +124,16 @@ load_config() {
     key=${line%%=*}
     val=${line#*=}
     case $key in
-      (POLL)          [[ $val == <-> ]] && (( val >= 2 && val <= 300 ))      && POLL=$val ;;
-      (MAX_HOLD)      [[ $val == <-> ]] && (( val >= 60 && val <= 604800 ))  && MAX_HOLD=$val ;;
-      (BATTERY_FLOOR) [[ $val == <-> ]] && (( val >= 0 && val <= 95 ))       && BATTERY_FLOOR=$val ;;
-      (GRACE)         [[ $val == <-> ]] && (( val >= 0 && val <= 7200 ))     && GRACE=$val ;;
-      (NOTIFY)        [[ $val == (all|forced|none) ]]                        && NOTIFY=$val ;;
-      (MATCH)         [[ $val =~ '^[A-Za-z0-9_.-]+$' ]]                      && MATCH=$val ;;
+      (POLL)          [[ $val == <-> ]] && (( val >= 2 && val <= 300 ))     && POLL=$val ;;
+      (IDLE_WINDOW|GRACE)
+                      [[ $val == <-> ]] && (( val >= 60 && val <= 14400 ))  && IDLE_WINDOW=$val ;;
+      (REMIND_EVERY)  [[ $val == <-> ]] && (( val == 0 || (val >= 900 && val <= 86400) )) && REMIND_EVERY=$val ;;
+      (BATTERY_FLOOR) [[ $val == <-> ]] && (( val >= 0 && val <= 95 ))      && BATTERY_FLOOR=$val ;;
+      (NOTIFY)        [[ $val == (all|forced|none) ]]                       && NOTIFY=$val ;;
+      (MATCH)         [[ $val =~ '^[A-Za-z0-9_.-]+$' ]]                     && MATCH=$val ;;
+      (WAKE_DAILY)    if [[ -z $val ]]; then WAKE_DAILY=
+                      elif [[ $val =~ '^([01][0-9]|2[0-3]):[0-5][0-9]$' ]]; then WAKE_DAILY=$val
+                      fi ;;
     esac
   done < $CONFIG
 }
@@ -162,8 +180,28 @@ apply() {
   fi
 }
 
+# A daily wake, so an overnight run has a chance to resume after the Mac has
+# been allowed to sleep. `pmset repeat` owns ONE repeating schedule for the
+# whole machine, so this is only touched when the setting actually changes.
+#
+# It starts empty rather than "unknown" on purpose: with no daily wake
+# configured there is nothing to do, and cancelling anyway would wipe a
+# repeating schedule the user set up themselves, at every boot.
+wake_applied=
+apply_wake_schedule() {
+  [[ $WAKE_DAILY == $wake_applied ]] && return
+  if [[ -z $WAKE_DAILY ]]; then
+    pmset repeat cancel 2>/dev/null
+    log "daily wake cancelled"
+  else
+    pmset repeat wakeorpoweron MTWRFSU ${WAKE_DAILY}:00 2>/dev/null
+    log "daily wake set for $WAKE_DAILY"
+  fi
+  wake_applied=$WAKE_DAILY
+}
+
 # A Mac with no battery (any desktop) reports no percentage at all, which reads
-# as 100% on mains, so the battery guardrail simply never fires there.
+# as 100% on mains, so the battery limit simply never fires there.
 battery_pct=100
 battery_state=ac
 read_battery() {
@@ -201,9 +239,10 @@ write_state() {
     print -r -- "idle_since=$idle_since"
     print -r -- "battery_pct=$battery_pct"
     print -r -- "battery_state=$battery_state"
-    print -r -- "max_hold=$MAX_HOLD"
+    print -r -- "idle_window=$IDLE_WINDOW"
+    print -r -- "remind_every=$REMIND_EVERY"
     print -r -- "battery_floor=$BATTERY_FLOOR"
-    print -r -- "grace=$GRACE"
+    print -r -- "wake_daily=$WAKE_DAILY"
     print -r -- "match=$MATCH"
     print -r -- "holder_names=${holder_names:-}"
     print -r -- "off=$( [[ -f $STATE_DIR/disabled ]] && print 1 || print 0 )"
@@ -213,6 +252,7 @@ write_state() {
 
 hold_since=0
 idle_since=0
+next_remind=0
 latched=
 prev_manual=0
 holder_names=
@@ -234,6 +274,7 @@ while true; do
   fi
 
   load_config
+  apply_wake_schedule
   read_battery
 
   holders=$(pgrep -x $MATCH 2>/dev/null | wc -l | tr -d ' ')
@@ -255,35 +296,27 @@ while true; do
   # Master switch, owned by the app's ON/OFF toggle.
   if [[ -f $STATE_DIR/disabled ]]; then
     apply 0 "turned off"
-    hold_since=0; idle_since=0; latched=; prev_manual=$manual
+    hold_since=0; idle_since=0; next_remind=0; latched=; prev_manual=$manual
     write_state 0 0 0 0
     sleep $POLL
     continue
   fi
 
-  # Latch clearing first, so a guardrail releases as soon as its cause is gone.
+  # The battery limit is the one thing that still ends a hold, and it latches so
+  # it cannot re-arm on the next check. It clears on mains power, or once the
+  # charge is comfortably above the floor again.
   if [[ $latched == battery ]]; then
     if [[ $battery_state != discharging ]] || (( battery_pct > BATTERY_FLOOR + 5 )); then
       log "battery limit cleared (${battery_pct}% $battery_state)"
       latched=
     fi
-  elif [[ $latched == deadline ]]; then
-    if (( ! demand )); then
-      log "time limit cleared (work ended)"
-      latched=
-    fi
   fi
 
-  # Guardrails.
   if (( demand )) && [[ -z $latched ]]; then
     if [[ $battery_state == discharging ]] && (( battery_pct <= BATTERY_FLOOR )); then
       latched=battery
       log "LIMIT battery: ${battery_pct}% discharging, letting it sleep again"
       notify forced "Battery ${battery_pct}%, so the Mac can sleep again even though work is running"
-    elif (( hold_since > 0 && now - hold_since >= MAX_HOLD )); then
-      latched=deadline
-      log "LIMIT time: kept awake $((now - hold_since))s, letting it sleep again"
-      notify forced "Awake for $((MAX_HOLD / 3600))h, so the Mac can sleep again even though work is running"
     fi
   fi
 
@@ -292,30 +325,39 @@ while true; do
 
   if (( want )); then
     idle_since=0
-    (( hold_since == 0 )) && hold_since=$now
+    if (( hold_since == 0 )); then
+      hold_since=$now
+      (( REMIND_EVERY > 0 )) && next_remind=$(( now + REMIND_EVERY )) || next_remind=0
+    fi
     if (( manual && holders == 0 )); then
       apply 1 "you asked for it"
     else
       apply 1 "$holders working"
     fi
+    # Nothing is ever cut off. This only surfaces a hold you may have forgotten.
+    if (( REMIND_EVERY > 0 && next_remind > 0 && now >= next_remind )); then
+      log "reminder: still keeping awake, $(( (now - hold_since) / 3600 ))h so far"
+      notify forced "Still keeping the Mac awake, $(( (now - hold_since) / 3600 ))h so far"
+      next_remind=$(( now + REMIND_EVERY ))
+    fi
   else
     if [[ -n $latched ]]; then
       apply 0 "$latched limit reached"
-      hold_since=0; idle_since=0
+      hold_since=0; idle_since=0; next_remind=0
     elif (( veto )); then
       apply 0 "you asked for it"
-      hold_since=0; idle_since=0
+      hold_since=0; idle_since=0; next_remind=0
     elif (( prev_manual && ! manual && holders == 0 )); then
       # You turned the manual hold off yourself, so release straight away.
       apply 0 "you asked for it"
-      hold_since=0; idle_since=0
+      hold_since=0; idle_since=0; next_remind=0
     elif (( hold_since > 0 )); then
-      # Work ended on its own: wait out the grace period before releasing, since
-      # a working session briefly drops its assertion between renewals.
-      (( idle_since == 0 )) && { idle_since=$now; log "work finished, waiting ${GRACE}s before allowing sleep" }
-      if (( now - idle_since >= GRACE )); then
-        apply 0 "work finished"
-        hold_since=0; idle_since=0
+      # Quiet, but quiet is not the same as finished: work stops and restarts
+      # constantly. Only sustained quiet, IDLE_WINDOW long, allows sleep.
+      (( idle_since == 0 )) && { idle_since=$now; log "quiet, allowing sleep in ${IDLE_WINDOW}s unless work resumes" }
+      if (( now - idle_since >= IDLE_WINDOW )); then
+        apply 0 "quiet for $(( IDLE_WINDOW / 60 ))m"
+        hold_since=0; idle_since=0; next_remind=0
       fi
     else
       apply 0 "nothing working"
